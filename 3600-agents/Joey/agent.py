@@ -476,6 +476,7 @@ class PlayerAgent:
 		my_points = bs.player_worker.get_points()
 		opp_points = bs.opponent_worker.get_points()
 		score_gap = my_points - opp_points
+		mobility_now = len(bs.get_valid_moves(exclude_search=True))
 
 		# Fast local conversion if available.
 		px, py = bs.player_worker.get_location()
@@ -491,7 +492,11 @@ class PlayerAgent:
 		if (
 			best_carpet is not None
 			and bs.is_valid_move(best_carpet)
-			and (best_carpet_pts >= 4 or turns_left <= ENDGAME_CONVERT_TURNS)
+			and (
+				best_carpet_pts >= 4
+				or turns_left <= ENDGAME_CONVERT_TURNS
+				or mobility_now <= 2
+			)
 		):
 			self.prev_action_type = best_carpet.move_type
 			return best_carpet

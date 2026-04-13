@@ -20,6 +20,16 @@ LOW_TIME_GREEDY_SECONDS = 10.0
 MID_TIME_SECONDS = 40.0
 ENDGAME_TURNS = 12
 THREAT_CARPET_POINTS = 4
+PROACTIVE_PRIME_MIN_RUN = 3
+STEAL_MIN_POINTS = 3
+SAFE_LEAD_GAP = 6
+COMEBACK_GAP = -6
+PANIC_DEFICIT_GAP = -8
+PANIC_THREAT_POINTS = 5
+PANIC_ENDGAME_TURNS = 14
+CLOSE_ENDGAME_TURNS = 8
+CLOSE_GAP = 5
+HIGH_THREAT_POINTS = 5
 
 
 def idx_xy(x, y):
@@ -270,6 +280,95 @@ def best_nearby_carpet_option(bs, start, turns_left):
 	return best
 
 
+def best_steal_carpet_option(bs, start, turns_left):
+	options = all_carpet_options(bs, start)
+	if not options:
+		return None
+
+	ox, oy = bs.opponent_worker.get_location()
+	opp_dist = bfs_dist_avoiding(bs, (ox, oy), start)
+
+	best = None
+	best_score = -1e9
+	for o in options:
+		if o["points"] < STEAL_MIN_POINTS:
+			continue
+		if turns_left < o["steps"] + 1:
+			continue
+
+		us = o["steps"]
+		them = opp_dist.get(o["cell"], 99)
+		if us > them + 1:
+			continue
+
+		# Prefer stealing lanes near opponent before they can cash out.
+		race = them - us
+		pressure = max(0, 4 - them)
+		s = o["points"] * 4.8 + o["roll"] * 0.9 + race * 1.0 + pressure * 1.6 - us * 0.8
+		if s > best_score:
+			best_score = s
+			best = o
+	return best
+
+
+def best_steal_carpet_option_aggressive(bs, start, turns_left):
+	options = all_carpet_options(bs, start)
+	if not options:
+		return None
+
+	ox, oy = bs.opponent_worker.get_location()
+	opp_dist = bfs_dist_avoiding(bs, (ox, oy), start)
+
+	best = None
+	best_score = -1e9
+	for o in options:
+		if o["points"] < 2:
+			continue
+		if turns_left < o["steps"] + 1:
+			continue
+		us = o["steps"]
+		them = opp_dist.get(o["cell"], 99)
+		if us > them + 2:
+			continue
+		race = them - us
+		s = o["points"] * 4.3 + o["roll"] * 0.9 + race * 1.1 - us * 0.7
+		if them <= 3:
+			s += 2.2
+		if s > best_score:
+			best_score = s
+			best = o
+	return best
+
+
+def best_prime_row_move(bs):
+	px, py = bs.player_worker.get_location()
+	ox, oy = bs.opponent_worker.get_location()
+	base_sep = abs(px - ox) + abs(py - oy)
+
+	best = None
+	best_score = -1e9
+	for d in DIRS:
+		m = Move.prime(d)
+		if not bs.is_valid_move(m):
+			continue
+
+		run = space_run(bs, px, py, d)
+		if run < PROACTIVE_PRIME_MIN_RUN:
+			continue
+
+		nx, ny = step_xy(px, py, d)
+		sep = abs(nx - ox) + abs(ny - oy)
+		sep_gain = sep - base_sep
+		lane_value = CARPET_POINTS_TABLE.get(min(run, BOARD_SIZE - 1), 0)
+
+		# Build long conversion lanes while drifting away from the opponent.
+		s = lane_value * 3.0 + run * 1.1 + sep_gain * 1.7 + 0.5 * open_neighbors(bs, (nx, ny))
+		if s > best_score:
+			best_score = s
+			best = m
+	return best
+
+
 def option_to_action(bs, start, opt):
 	if opt is None:
 		return None
@@ -356,6 +455,11 @@ def evaluate(bs, belief):
 
 	turns_left = bs.player_worker.turns_left
 	threat_w = 2.0 if turns_left > ENDGAME_TURNS else 2.8
+	gap = my_pts - op_pts
+	if gap >= SAFE_LEAD_GAP:
+		threat_w += 0.8
+	elif gap <= COMEBACK_GAP:
+		threat_w -= 0.4
 	score += 2.2 * my_carpet
 	score -= threat_w * op_carpet
 
@@ -367,6 +471,13 @@ def evaluate(bs, belief):
 	if (bx, by) in dm:
 		score += 2.4 * best_p * (cell_potential(bs, bx, by) / (1.0 + dm[(bx, by)]))
 
+	# Slightly de-risk when ahead and push tempo when behind.
+	if gap >= SAFE_LEAD_GAP:
+		score += 0.6 * my_carpet
+		score -= 0.6 * op_carpet
+	if gap <= COMEBACK_GAP:
+		score += 0.9 * len(bs.get_valid_moves(exclude_search=True))
+
 	score += 0.6 * open_neighbors(bs, (mx, my))
 
 	score += 0.7 * len(bs.get_valid_moves(exclude_search=True))
@@ -375,6 +486,8 @@ def evaluate(bs, belief):
 
 def order_moves(bs, belief, moves):
 	px, py = bs.player_worker.get_location()
+	ox, oy = bs.opponent_worker.get_location()
+	base_sep = abs(px - ox) + abs(py - oy)
 	scored = []
 	for m in moves:
 		s = 0.0
@@ -385,12 +498,17 @@ def order_moves(bs, belief, moves):
 			s += 5.0 + 1.3 * sr
 			if open_neighbors(bs, (px, py)) <= 1:
 				s -= 6.0
+			nx, ny = step_xy(px, py, m.direction)
+			sep = abs(nx - ox) + abs(ny - oy)
+			s += 1.2 * (sep - base_sep)
 		elif m.move_type == MoveType.PLAIN:
 			nx, ny = step_xy(px, py, m.direction)
 			if bs.is_valid_cell((nx, ny)):
 				s += cell_potential(bs, nx, ny)
 				s += 3.0 * float(belief[idx_xy(nx, ny)])
 				s += 0.5 * open_neighbors(bs, (nx, ny))
+				sep = abs(nx - ox) + abs(ny - oy)
+				s += 1.4 * (sep - base_sep)
 		scored.append((s, m))
 	scored.sort(key=lambda t: t[0], reverse=True)
 	return [m for _, m in scored]
@@ -407,6 +525,125 @@ class PlayerAgent:
 
 	def commentate(self):
 		return "cassie: hmm + expectiminimax"
+
+	def _best_panic_move(self, bs, belief):
+		moves = bs.get_valid_moves(exclude_search=True)
+		if not moves:
+			return None
+
+		px, py = bs.player_worker.get_location()
+		ox, oy = bs.opponent_worker.get_location()
+		base_sep = abs(px - ox) + abs(py - oy)
+
+		best = None
+		best_score = -1e18
+		for m in moves:
+			child = bs.forecast_move(m, check_ok=True)
+			if child is None:
+				continue
+
+			gain = 0.0
+			if m.move_type == MoveType.CARPET:
+				gain = float(CARPET_POINTS_TABLE.get(min(m.roll_length, BOARD_SIZE - 1), 0))
+			elif m.move_type == MoveType.PLAIN:
+				nx, ny = step_xy(px, py, m.direction)
+				if bs.is_valid_cell((nx, ny)):
+					gain = 0.25 * cell_potential(bs, nx, ny) + 0.6 * float(belief[idx_xy(nx, ny)])
+					gain += 0.2 * max(0, abs(nx - ox) + abs(ny - oy) - base_sep)
+			elif m.move_type == MoveType.PRIME:
+				# In panic mode, prime is generally risky unless it creates a very long lane.
+				gain = 0.2 * space_run(bs, px, py, m.direction)
+
+			# Forecast opponent's immediate cash-out after our move.
+			child.reverse_perspective()
+			_, opp_threat = immediate_carpet_move(child)
+
+			score = 4.2 * gain - 3.2 * float(opp_threat)
+			if m.move_type == MoveType.PRIME:
+				score -= 2.5
+			if score > best_score:
+				best_score = score
+				best = m
+
+		return best
+
+	def _best_close_endgame_move(self, bs, belief):
+		moves = bs.get_valid_moves(exclude_search=True)
+		if not moves:
+			return None
+
+		best = None
+		best_score = -1e18
+		for m in moves:
+			child = bs.forecast_move(m, check_ok=True)
+			if child is None:
+				continue
+
+			# Evaluate immediate swing from this move and next-turn threat suppression.
+			my_now = child.player_worker.get_points()
+			op_now = child.opponent_worker.get_points()
+			base = 8.0 * (my_now - op_now)
+
+			child.reverse_perspective()
+			opp_best, opp_threat = immediate_carpet_move(child)
+			anti_swing = -3.8 * float(opp_threat)
+
+			# If opponent has a big response, reward moves that preserve our own cashout next.
+			follow_up = 0.0
+			child2 = None
+			if opp_best is not None and child.is_valid_move(opp_best):
+				child2 = child.forecast_move(opp_best, check_ok=True)
+			if child2 is not None:
+				child2.reverse_perspective()
+				_, my_next = immediate_carpet_move(child2)
+				follow_up = 2.0 * float(my_next)
+
+			shape = 0.0
+			if m.move_type == MoveType.PLAIN:
+				px, py = child.player_worker.get_location()
+				shape += 0.3 * cell_potential(child, px, py)
+				shape += 0.5 * float(belief[idx_xy(px, py)])
+			elif m.move_type == MoveType.PRIME:
+				shape -= 1.8
+
+			score = base + anti_swing + follow_up + shape
+			if score > best_score:
+				best_score = score
+				best = m
+
+		return best
+
+	def _best_anti_threat_move(self, bs, belief):
+		"""Choose a move that minimizes opponent's immediate carpet threat next turn."""
+		moves = bs.get_valid_moves(exclude_search=True)
+		if not moves:
+			return None
+
+		best = None
+		best_score = -1e18
+		for m in moves:
+			child = bs.forecast_move(m, check_ok=True)
+			if child is None:
+				continue
+
+			my_now = child.player_worker.get_points()
+			op_now = child.opponent_worker.get_points()
+
+			child.reverse_perspective()
+			_, opp_threat = immediate_carpet_move(child)
+
+			# Maximize current value while heavily suppressing opponent cash-out.
+			score = 6.5 * (my_now - op_now) - 4.0 * float(opp_threat)
+			if m.move_type == MoveType.CARPET:
+				score += 2.5
+			elif m.move_type == MoveType.PRIME:
+				score -= 2.0
+
+			if score > best_score:
+				best_score = score
+				best = m
+
+		return best
 
 	def _negamax(self, bs, depth, alpha, beta, belief, deadline, max_branch):
 		if depth == 0 or bs.is_game_over() or time.perf_counter() >= deadline:
@@ -446,8 +683,18 @@ class PlayerAgent:
 		if time_left_seconds > 30.0 and (turns_left <= 10 or abs(score_gap) <= 8):
 			depth = 3
 			max_branch = 10
+		if time_left_seconds > 18.0 and score_gap <= PANIC_DEFICIT_GAP:
+			depth = 3
+			max_branch = 12
+		if time_left_seconds > 16.0 and turns_left <= 16 and abs(score_gap) <= 4:
+			depth = 3
+			max_branch = 12
 
 		budget = 0.18 if time_left_seconds > MID_TIME_SECONDS else 0.09
+		if score_gap <= PANIC_DEFICIT_GAP and time_left_seconds > 18.0:
+			budget += 0.04
+		if turns_left <= 16 and abs(score_gap) <= 4 and time_left_seconds > 16.0:
+			budget += 0.03
 		deadline = time.perf_counter() + budget
 
 		moves = bs.get_valid_moves(exclude_search=True)
@@ -503,10 +750,13 @@ class PlayerAgent:
 		for d in DIRS:
 			enemy_now = max(enemy_now, CARPET_POINTS_TABLE.get(min(primed_run(bs, ox, oy, d), BOARD_SIZE - 1), 0))
 
+		panic_mode = score_gap <= PANIC_DEFICIT_GAP and (enemy_now >= PANIC_THREAT_POINTS or bs.player_worker.turns_left <= PANIC_ENDGAME_TURNS)
+		high_threat_mode = enemy_now >= HIGH_THREAT_POINTS and bs.player_worker.turns_left <= 20
+
 		# 1) Immediate carpet conversion first.
 		carpet, carpet_pts = immediate_carpet_move(bs)
 		if carpet is not None and bs.is_valid_move(carpet):
-			if carpet_pts >= 2 or bs.player_worker.turns_left <= 12:
+			if carpet_pts >= 2 or bs.player_worker.turns_left <= 12 or panic_mode:
 				return carpet
 
 		# 1b) Deny strong enemy conversions by racing/stealing contested carpets.
@@ -516,11 +766,42 @@ class PlayerAgent:
 			if a is not None:
 				return a
 
+		if panic_mode:
+			panic = self._best_panic_move(bs, belief)
+			if panic is not None and bs.is_valid_move(panic):
+				return panic
+
+		if high_threat_mode:
+			anti = self._best_anti_threat_move(bs, belief)
+			if anti is not None and bs.is_valid_move(anti):
+				return anti
+
+		# In tight endgames, choose the move with best short-horizon swing.
+		if bs.player_worker.turns_left <= CLOSE_ENDGAME_TURNS and abs(score_gap) <= CLOSE_GAP:
+			endgame = self._best_close_endgame_move(bs, belief)
+			if endgame is not None and bs.is_valid_move(endgame):
+				return endgame
+
 		# 1c) Nearby conversion routing reduces dropped points.
 		near = best_nearby_carpet_option(bs, start, bs.player_worker.turns_left)
 		a = option_to_action(bs, start, near)
 		if a is not None:
 			return a
+
+		# 1d) Steal high-value primed lanes near the opponent.
+		if score_gap <= COMEBACK_GAP:
+			steal = best_steal_carpet_option_aggressive(bs, start, bs.player_worker.turns_left)
+		else:
+			steal = best_steal_carpet_option(bs, start, bs.player_worker.turns_left)
+		a = option_to_action(bs, start, steal)
+		if a is not None:
+			return a
+
+		# 1e) Proactively build long prime rows away from opponent pressure.
+		if bs.player_worker.turns_left > ENDGAME_TURNS and score_gap < SAFE_LEAD_GAP and not panic_mode:
+			prime_row = best_prime_row_move(bs)
+			if prime_row is not None:
+				return prime_row
 
 		# 2) Expectiminimax search move.
 		m = self._best_move_search(bs, belief, tl, score_gap)
@@ -528,7 +809,7 @@ class PlayerAgent:
 			return m
 
 		# 3) Controlled search usage.
-		if self.search_cd == 0 and tl > 6.0:
+		if self.search_cd == 0 and tl > 6.0 and enemy_now <= 2 and abs(score_gap) <= 4 and bs.player_worker.turns_left > 10:
 			best_i = int(np.argmax(belief))
 			best_p = float(belief[best_i])
 			if best_p > 0.18:
