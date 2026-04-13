@@ -12,6 +12,42 @@ _DELTA = {
     Direction.RIGHT: (1,  0),
 }
 
+
+CARPET_WEIGHT = 3.2
+CARPET_ROLL_WEIGHT = 0.6
+CARPET_ON_CELL_BONUS = 1.2
+PRIME_WEIGHT = 3.0
+RAT_WEIGHT = 2.0
+PRIME_RUN_WEIGHT = 0.25
+PRIME_ON_CELL_BONUS = 0.8
+DISTANCE_POWER = 0.95
+PRIME_MAX_STEPS = 1
+PRIME_MAX_RUN = 5
+PRIME_MIN_POINTS = 4
+STALL_CARPET_TURNS = 4
+SEARCH_HIGH_EV = 0.95
+SEARCH_LOW_EV = 0.0
+SEARCH_STALL_TURNS = 8
+MIDGAME_TURNS = 18
+ENDGAME_TURNS = 10
+OPPONENT_AVOID_WEIGHT = 2.4
+PATH_COST_WEIGHT = 1.1
+CONTROL_STICK_TURNS = 6
+OPEN_SPACE_WEIGHT = 2.2
+EDGE_PENALTY = 0.9
+STEAL_MIN_POINTS = 4
+STEAL_RACE_BONUS = 1.8
+STEAL_DENIAL_WEIGHT = 1.4
+PRIME_CANCEL_MARGIN = 1.8
+TACTICAL_POINT_WEIGHT = 7.0
+TACTICAL_FUTURE_CARPET_WEIGHT = 1.1
+TACTICAL_CONTROL_WEIGHT = 1.2
+TACTICAL_OPP_DIST_WEIGHT = 0.4
+TACTICAL_BAD_PRIME_PENALTY = 6.0
+TACTICAL_PLAIN_GAP_PENALTY = 0.2
+TACTICAL_MIN_SCORE = 2.5
+CARPET_PLAN_MIN_POINTS = 3
+
 def _loc(i):        return (i % BOARD_SIZE, i // BOARD_SIZE)
 def _idx(x, y):     return y * BOARD_SIZE + x
 def _step(x, y, d): dx, dy = _DELTA[d]; return x+dx, y+dy
@@ -92,6 +128,131 @@ def _space_run(bs, x, y, d):
     return run
 
 
+def _prime_bridge_value(bs, x, y, d):
+    """
+    If we PRIME from (x,y) toward d, estimate how much primed chain we connect to
+    from the next square after moving.
+    """
+    if bs.get_cell((x, y)) != Cell.SPACE:
+        return 0
+
+    nx, ny = _step(x, y, d)
+    if not bs.is_valid_cell((nx, ny)):
+        return 0
+    if (nx, ny) == bs.opponent_worker.get_location():
+        return 0
+    if bs.get_cell((nx, ny)) != Cell.SPACE:
+        return 0
+
+    return _primed_run(bs, nx, ny, d)
+
+
+def _prime_time_feasible(turns_left, steps_to_start, run_len):
+    """
+    Conservative time budget:
+    steps_to_start (movement/setup) + run_len (prime turns) + 1 (carpet turn).
+    """
+    needed = int(steps_to_start) + max(1, int(run_len)) + 1
+    return turns_left >= needed
+
+
+def _estimate_continue_prime_value(bs, turns_left, prime_remaining):
+    """
+    Approximate value of continuing current prime commitment.
+    Includes immediate prime point plus discounted future carpet conversion value.
+    """
+    rem = max(1, int(prime_remaining))
+    if not _prime_time_feasible(turns_left, 0, rem):
+        return -1e9
+    future_carpet = _carpet_points(rem)
+    return 1.0 + 0.65 * future_carpet
+
+
+def _estimate_best_alt_value(bs, start):
+    """
+    Approximate best alternative value from steal/carpet opportunities.
+    """
+    best = -1e9
+
+    steal = _best_steal_option(bs, start)
+    if steal is not None:
+        s = steal["points"] * 3.8 / (steal["steps"] + 1.0) + steal["roll"] * 0.5
+        best = max(best, s)
+
+    for o in _all_carpet_options(bs, start):
+        s = o["points"] * 3.2 / (o["steps"] + 1.0) + o["roll"] * 0.5
+        best = max(best, s)
+
+    return best
+
+
+def _best_reachable_carpet_option(bs, start, turns_left):
+    options = _all_carpet_options(bs, start)
+    best = None
+    best_score = -1e9
+    for o in options:
+        if o["points"] < CARPET_PLAN_MIN_POINTS:
+            continue
+        # Need at least steps to reach + one carpet turn.
+        if turns_left < o["steps"] + 1:
+            continue
+        score = o["points"] * 4.0 + o["roll"] * 0.8 - o["steps"] * 1.2
+        if score > best_score:
+            best_score = score
+            best = o
+    return best
+
+
+def _best_tactical_move(bs, turns_left):
+    """
+    One-ply tactical selector for consistency: immediate gain + future conversion +
+    local control. Returns (move, score) or (None, -inf).
+    """
+    moves = bs.get_valid_moves(exclude_search=True)
+    if not moves:
+        return None, -1e9
+
+    cur_points = bs.player_worker.get_points()
+    cur_pos = bs.player_worker.get_location()
+    cur_cell = bs.get_cell(cur_pos)
+
+    best_move = None
+    best_score = -1e9
+
+    for m in moves:
+        nxt = bs.forecast_move(m, check_ok=True)
+        if nxt is None:
+            continue
+
+        nxt_points = nxt.player_worker.get_points()
+        immediate = nxt_points - cur_points
+
+        nx, ny = nxt.player_worker.get_location()
+        ox, oy = nxt.opponent_worker.get_location()
+
+        max_roll = 0
+        for d in DIRS:
+            max_roll = max(max_roll, _primed_run(nxt, nx, ny, d))
+
+        score = 0.0
+        score += immediate * TACTICAL_POINT_WEIGHT
+        score += _carpet_points(max_roll) * TACTICAL_FUTURE_CARPET_WEIGHT
+        score += _control_open_score(nxt, nx, ny) * TACTICAL_CONTROL_WEIGHT
+        score += (abs(nx - ox) + abs(ny - oy)) * TACTICAL_OPP_DIST_WEIGHT
+
+        if m.move_type == MoveType.PRIME and not _prime_time_feasible(turns_left, 0, max(1, max_roll)):
+            score -= TACTICAL_BAD_PRIME_PENALTY
+
+        if m.move_type == MoveType.PLAIN and cur_cell == Cell.SPACE:
+            score -= TACTICAL_PLAIN_GAP_PENALTY
+
+        if score > best_score:
+            best_score = score
+            best_move = m
+
+    return best_move, best_score
+
+
 def _best_carpet_move(bs):
     x, y = bs.player_worker.get_location()
     best_move, best_score = None, 0
@@ -111,8 +272,8 @@ def _carpet_points(roll_len):
 
 
 def _distance_multiplier(steps):
-    # Multiply value by a distance term so closer opportunities are preferred.
-    return 1.0 / (steps + 1.0)
+    # Heavier distance discount to avoid wandering while opponent cashes carpets.
+    return 1.0 / ((steps + 1.0) ** DISTANCE_POWER)
 
 
 def _all_carpet_options(bs, start):
@@ -175,18 +336,82 @@ def _best_distance_weighted_option(carpet_options, prime_options):
     best = None
 
     for o in carpet_options:
-        base_value = o["points"] * 3.0 + o["roll"]
+        base_value = o["points"] * CARPET_WEIGHT + o["roll"] * CARPET_ROLL_WEIGHT
+        if o["steps"] == 0:
+            base_value += CARPET_ON_CELL_BONUS
         score = base_value * _distance_multiplier(o["steps"])
         candidate = {"score": score, **o}
         if best is None or candidate["score"] > best["score"]:
             best = candidate
 
     for o in prime_options:
-        base_value = o["points"] * 2.0 + o["rat_mass"] * 3.0
+        base_value = o["points"] * PRIME_WEIGHT + o["rat_mass"] * RAT_WEIGHT
+        base_value += o["run"] * PRIME_RUN_WEIGHT
+        if o["steps"] == 0:
+            base_value += PRIME_ON_CELL_BONUS
         score = base_value * _distance_multiplier(o["steps"])
         candidate = {"score": score, **o}
         if best is None or candidate["score"] > best["score"]:
             best = candidate
+
+    return best
+
+
+def _best_distance_weighted_carpet_option(carpet_options):
+    best = None
+    for o in carpet_options:
+        base_value = o["points"] * CARPET_WEIGHT + o["roll"] * CARPET_ROLL_WEIGHT
+        if o["steps"] == 0:
+            base_value += CARPET_ON_CELL_BONUS
+        score = base_value * _distance_multiplier(o["steps"])
+        candidate = {"score": score, **o}
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def _best_steal_option(bs, start):
+    """
+    Find a high-value carpet opportunity that we can likely claim before opponent.
+    Returns an option dict from _all_carpet_options, or None.
+    """
+    carpet_options = _all_carpet_options(bs, start)
+    if not carpet_options:
+        return None
+
+    ox, oy = bs.opponent_worker.get_location()
+    opp_dist = _bfs_avoiding(bs, (ox, oy), start)
+
+    best = None
+    best_score = -1e9
+    for o in carpet_options:
+        if o["points"] < STEAL_MIN_POINTS:
+            continue
+
+        us = o["steps"]
+        them = opp_dist.get(o["cell"], 99)
+        # Need to arrive no later than opponent to realistically steal/deny.
+        if us > them:
+            continue
+
+        # Denial estimate: if opponent reaches this cell, estimate their best
+        # immediate convertible primed roll from that location.
+        ox, oy = o["cell"]
+        opp_best_roll = 0
+        for d in DIRS:
+            opp_best_roll = max(opp_best_roll, _primed_run(bs, ox, oy, d))
+        denied_points = _carpet_points(opp_best_roll)
+
+        race_margin = them - us
+        score = (
+            o["points"] * 5.0
+            + o["roll"] * 1.5
+            + race_margin * STEAL_RACE_BONUS
+            + denied_points * STEAL_DENIAL_WEIGHT
+        )
+        if score > best_score:
+            best_score = score
+            best = o
 
     return best
 
@@ -212,6 +437,29 @@ def _bfs(bs, start):
             if _standard_passable(bs, nx, ny):
                 dist[(nx, ny)] = dist[(cx, cy)] + 1
                 q.append((nx, ny))
+    return dist
+
+
+def _bfs_avoiding(bs, start, avoid_loc):
+    dist = {start: 0}
+    q = [start]
+    head = 0
+    while head < len(q):
+        cx, cy = q[head]
+        head += 1
+        for d in DIRS:
+            nx, ny = _step(cx, cy, d)
+            if (nx, ny) in dist:
+                continue
+            if not bs.is_valid_cell((nx, ny)):
+                continue
+            if (nx, ny) == avoid_loc:
+                continue
+            c = bs.get_cell((nx, ny))
+            if c in (Cell.BLOCKED, Cell.PRIMED):
+                continue
+            dist[(nx, ny)] = dist[(cx, cy)] + 1
+            q.append((nx, ny))
     return dist
 
 
@@ -246,13 +494,14 @@ def _pick_prime_direction(bs, belief):
     Scores each direction by:
       - Length of space run (longer = more carpet points)
       - Belief mass in that direction (rat proximity bonus)
-    Returns (direction, run_length) or (None, 0).
+    Returns (direction, run_length, bridge_value) or (None, 0, 0).
     """
     px, py = bs.player_worker.get_location()
-    best_d, best_score, best_r = None, -1, 0
+    best_d, best_score, best_r, best_bridge = None, -1, 0, 0
     for d in DIRS:
         r = _space_run(bs, px, py, d)
-        if r < 2:
+        bridge = _prime_bridge_value(bs, px, py, d)
+        if r < 2 and bridge <= 0:
             continue
         carpet_pts = CARPET_POINTS_TABLE.get(min(r, 7), 0)
         # Belief mass along this run
@@ -261,12 +510,13 @@ def _pick_prime_direction(bs, belief):
         for _ in range(r):
             cx, cy = _step(cx, cy, d)
             rat_mass += float(belief[_idx(cx, cy)])
-        score = carpet_pts * 3.0 + rat_mass * 2.0
+        score = carpet_pts * 3.0 + rat_mass * 2.0 + bridge * 4.0
         if score > best_score:
             best_score = score
             best_d = d
             best_r = r
-    return best_d, best_r
+            best_bridge = bridge
+    return best_d, best_r, best_bridge
 
 
 def _find_best_space_destination(bs, belief):
@@ -293,22 +543,74 @@ def _find_best_space_destination(bs, belief):
             if r < 2:
                 continue
             pts = CARPET_POINTS_TABLE.get(min(r, 7), 0)
-            rat_mass = 0.0
-            cx, cy = x, y
-            for _ in range(r):
-                cx, cy = _step(cx, cy, d)
-                rat_mass += float(belief[_idx(cx, cy)])
-            s = pts * 3.0 + rat_mass * 2.0
+            # Reduce rat-chasing: score mostly by setup quality and board control.
+            s = pts * 3.0 + r * 0.6
             if s > best_run_score:
                 best_run_score = s
         if best_run_score <= 0:
             continue
-        score = best_run_score - steps * 2.0
+
+        opp_dist = abs(x - ox) + abs(y - oy)
+        score = best_run_score + opp_dist * OPPONENT_AVOID_WEIGHT - steps * PATH_COST_WEIGHT
         if score > best_score:
             best_score = score
             best_loc = (x, y)
 
     return best_loc
+
+
+def _control_open_score(bs, x, y):
+    score = 0.0
+    for d in DIRS:
+        nx, ny = _step(x, y, d)
+        if not bs.is_valid_cell((nx, ny)):
+            continue
+        c = bs.get_cell((nx, ny))
+        if c == Cell.SPACE:
+            score += 1.0
+        elif c == Cell.PRIMED:
+            score += 0.35
+    # Prefer cells that can extend into longer lanes.
+    best_lane = 0
+    for d in DIRS:
+        best_lane = max(best_lane, _space_run(bs, x, y, d))
+    score += best_lane * 0.6
+    return score
+
+
+def _pick_board_control_target(bs, start, previous_target=None):
+    px, py = start
+    ox, oy = bs.opponent_worker.get_location()
+    bfs_dist = _bfs(bs, start)
+
+    best_target = None
+    best_score = -1e9
+    for (x, y), steps in bfs_dist.items():
+        if steps == 0:
+            continue
+        if bs.get_cell((x, y)) != Cell.SPACE:
+            continue
+
+        open_score = _control_open_score(bs, x, y)
+        opp_dist = abs(x - ox) + abs(y - oy)
+        edge_dist = min(x, y, BOARD_SIZE - 1 - x, BOARD_SIZE - 1 - y)
+
+        score = (
+            open_score * OPEN_SPACE_WEIGHT
+            + opp_dist * OPPONENT_AVOID_WEIGHT
+            - steps * PATH_COST_WEIGHT
+            - (2 - min(edge_dist, 2)) * EDGE_PENALTY
+        )
+
+        # Keep pursuing prior target when still good to reduce oscillation.
+        if previous_target is not None and (x, y) == previous_target:
+            score += 2.0
+
+        if score > best_score:
+            best_score = score
+            best_target = (x, y)
+
+    return best_target
 
 
 def _best_search(belief, bs):
@@ -334,6 +636,10 @@ class PlayerAgent:
         # Track the start of the prime run so we can carpet roll from there
         self.prime_run_start = None
         self.prime_run_len = 0
+        self.last_points = 0
+        self.no_gain_turns = 0
+        self.control_target = None
+        self.control_target_age = 0
 
     def commentate(self):
         return "global prime/carpet optimizer"
@@ -352,74 +658,172 @@ class PlayerAgent:
         px, py = bs.player_worker.get_location()
         current_cell = bs.get_cell((px, py))
         turns_left = bs.player_worker.turns_left
+        # 1) Carpet immediately if profitable.
+        carpet = _best_carpet_move(bs)
+        if carpet is not None:
+            self.prime_dir = None
+            self.prime_remaining = 0
+            self.prime_run_start = None
+            return carpet
 
-        # 1) Continue committed prime run first.
-        if self.prime_dir is not None and self.prime_remaining > 0:
-            c = Move.prime(self.prime_dir)
-            if bs.is_valid_move(c):
-                self.prime_remaining -= 1
-                if self.prime_remaining == 0:
+        # 1.5) Steal/deny valuable primed lanes before opponent can convert.
+        steal = _best_steal_option(bs, (px, py))
+        if steal is not None:
+            if steal["steps"] == 0:
+                c = Move.carpet(steal["direction"], steal["roll"])
+                if bs.is_valid_move(c):
                     self.prime_dir = None
-                return c
+                    self.prime_remaining = 0
+                    self.prime_run_start = None
+                    self.control_target = None
+                    self.control_target_age = 0
+                    return c
             else:
-                # Run blocked (opponent stepped in, etc.) — abandon
+                d = _next_step_toward(bs, (px, py), steal["cell"])
+                if d is not None:
+                    # When racing to steal, prefer arriving quickly over creating more primed residue.
+                    c = Move.plain(d)
+                    if bs.is_valid_move(c):
+                        return c
+
+        # 1.75) If there are good reachable carpets, route toward converting them.
+        carpet_plan = _best_reachable_carpet_option(bs, (px, py), turns_left)
+        if carpet_plan is not None:
+            if carpet_plan["steps"] == 0:
+                c = Move.carpet(carpet_plan["direction"], carpet_plan["roll"])
+                if bs.is_valid_move(c):
+                    self.prime_dir = None
+                    self.prime_remaining = 0
+                    self.prime_run_start = None
+                    return c
+            else:
+                d = _next_step_toward(bs, (px, py), carpet_plan["cell"])
+                if d is not None:
+                    c = Move.plain(d)
+                    if bs.is_valid_move(c):
+                        return c
+
+        # 2) Continue committed prime run.
+        if self.prime_dir is not None and self.prime_remaining > 0:
+            # If there isn't enough time to finish this prime sequence and convert,
+            # drop commitment and pivot.
+            if turns_left <= self.prime_remaining + 1:
                 self.prime_dir = None
                 self.prime_remaining = 0
                 self.prime_run_start = None
+            else:
+                continue_value = _estimate_continue_prime_value(bs, turns_left, self.prime_remaining)
+                alt_value = _estimate_best_alt_value(bs, (px, py))
 
-        # 2) Evaluate all reachable carpet and prime opportunities.
-        start = (px, py)
-        carpet_options = _all_carpet_options(bs, start)
-        prime_options = _all_prime_options(bs, start, belief)
-        best_option = _best_distance_weighted_option(carpet_options, prime_options)
-
-        if best_option is not None:
-            if best_option["kind"] == "carpet":
-                if best_option["steps"] == 0:
-                    c = Move.carpet(best_option["direction"], best_option["roll"])
+                if alt_value > continue_value + PRIME_CANCEL_MARGIN:
+                    self.prime_dir = None
+                    self.prime_remaining = 0
+                    self.prime_run_start = None
+                else:
+                    c = Move.prime(self.prime_dir)
                     if bs.is_valid_move(c):
+                        self.prime_remaining -= 1
+                        if self.prime_remaining == 0:
+                            self.prime_dir = None
+                        return c
+                    else:
                         self.prime_dir = None
                         self.prime_remaining = 0
                         self.prime_run_start = None
-                        return c
-                else:
-                    d = _next_step_toward(bs, start, best_option["cell"])
-                    if d is not None:
-                        c = Move.plain(d)
-                        if bs.is_valid_move(c):
-                            return c
 
-            if best_option["kind"] == "prime":
-                if best_option["steps"] == 0 and current_cell == Cell.SPACE:
-                    c = Move.prime(best_option["direction"])
+        # 2.5) Tactical one-turn choice to reduce sporadic behavior.
+        tactical_move, tactical_score = _best_tactical_move(bs, turns_left)
+        if tactical_move is not None and tactical_score >= TACTICAL_MIN_SCORE:
+            if tactical_move.move_type == MoveType.PRIME:
+                # If this is a committed tactical prime, track remaining run.
+                if tactical_move.direction is not None:
+                    sr = _space_run(bs, px, py, tactical_move.direction)
+                    if sr >= 2:
+                        self.prime_dir = tactical_move.direction
+                        self.prime_remaining = sr - 1
+                        self.prime_run_start = (px, py)
+                        self.prime_run_len = sr
+                    else:
+                        self.prime_dir = None
+                        self.prime_remaining = 0
+            return tactical_move
+
+        # 3) Start a strong prime run if on SPACE.
+        if current_cell == Cell.SPACE:
+            best_d, best_r, best_bridge = _pick_prime_direction(bs, belief)
+            if best_d is not None:
+                expected = CARPET_POINTS_TABLE.get(min(best_r, BOARD_SIZE - 1), 0)
+                if ((best_r >= 3 and expected >= 4) or best_bridge >= 2) and _prime_time_feasible(turns_left, 0, best_r):
+                    c = Move.prime(best_d)
                     if bs.is_valid_move(c):
-                        self.prime_dir = best_option["direction"]
-                        self.prime_remaining = best_option["run"] - 1
-                        self.prime_run_start = start
-                        self.prime_run_len = best_option["run"]
+                        if best_r >= 2:
+                            self.prime_dir = best_d
+                            self.prime_remaining = best_r - 1
+                        else:
+                            self.prime_dir = None
+                            self.prime_remaining = 0
+                        self.prime_run_start = (px, py)
+                        self.prime_run_len = best_r
                         return c
-                else:
-                    d = _next_step_toward(bs, start, best_option["cell"])
-                    if d is not None:
-                        c = Move.plain(d)
+
+        # 4) Search when EV is high.
+        if self.search_cd == 0:
+            loc, ev = _best_search(belief, bs)
+            if ev > 1.35:
+                self.search_cd = 3
+                return Move.search(loc)
+
+        # 5) Move toward best prime-building space destination.
+        # Keep a stable board-control target for several turns.
+        bfs_now = _bfs(bs, (px, py))
+        keep_target = (
+            self.control_target is not None
+            and self.control_target in bfs_now
+            and self.control_target != (px, py)
+            and self.control_target_age < CONTROL_STICK_TURNS
+        )
+        if keep_target:
+            target = self.control_target
+            self.control_target_age += 1
+        else:
+            target = _pick_board_control_target(bs, (px, py), self.control_target)
+            self.control_target = target
+            self.control_target_age = 0
+
+        if target is not None and target != (px, py):
+            d = _next_step_toward(bs, (px, py), target)
+            if d is not None:
+                if current_cell == Cell.SPACE:
+                    sr = _space_run(bs, px, py, d)
+                    bridge = _prime_bridge_value(bs, px, py, d)
+                    if (sr >= 2 or bridge > 0) and _prime_time_feasible(turns_left, 0, max(sr, 1)):
+                        c = Move.prime(d)
                         if bs.is_valid_move(c):
+                            if sr >= 2:
+                                self.prime_dir = d
+                                self.prime_remaining = sr - 1
+                            else:
+                                self.prime_dir = None
+                                self.prime_remaining = 0
+                            self.prime_run_start = (px, py)
+                            self.prime_run_len = sr
                             return c
+                c = Move.plain(d)
+                if bs.is_valid_move(c):
+                    return c
 
-        # 3) Search when no high-value board action is available.
+        if target == (px, py):
+            self.control_target = None
+            self.control_target_age = 0
+
+        # 6) Lower-threshold search if stuck.
         if self.search_cd == 0:
             loc, ev = _best_search(belief, bs)
-            if ev > 1.5:
+            if ev > 0.4:
                 self.search_cd = 3
                 return Move.search(loc)
 
-        # 4) Search at lower EV threshold if truly stuck.
-        if self.search_cd == 0:
-            loc, ev = _best_search(belief, bs)
-            if ev > 0:
-                self.search_cd = 3
-                return Move.search(loc)
-
-        # 5) Fallback: any valid move.
+        # 7) Fallback: any valid move.
         moves = bs.get_valid_moves(exclude_search=True)
         if moves:
             for m in moves:
