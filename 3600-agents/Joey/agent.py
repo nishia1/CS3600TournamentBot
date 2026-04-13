@@ -24,6 +24,11 @@ NEARBY_CARPET_MIN_POINTS = 1
 CLUTCH_AB_DEPTH = 4
 CLUTCH_TURNS = 10
 CLUTCH_GAP = 8
+TRAP_PRIME_ROOT_PENALTY = 10.0
+NO_PRIME_MOBILITY_CUTOFF = 1
+NO_PRIME_CARPET_EXCEPTION = 4
+LOW_TIME_GREEDY_SECONDS = 8.0
+LOW_TIME_SHALLOW_SECONDS = 20.0
 
 
 def step_xy(x, y, d):
@@ -298,6 +303,14 @@ def evaluate(bs):
 	ox, oy = bs.opponent_worker.get_location()
 	score += 0.2 * (abs(px - ox) + abs(py - oy))
 	score += 0.6 * open_neighbors(bs, (px, py))
+
+	# Mobility term to avoid self-trapping and pacing in tight corridors.
+	mobility = len(bs.get_valid_moves(exclude_search=True))
+	score += 0.5 * mobility
+	if mobility <= 2:
+		score -= 3.5
+	if mobility <= 1:
+		score -= 8.0
 	return score
 
 
@@ -309,7 +322,7 @@ def move_heuristic(bs, m, action_bias):
 	elif m.move_type == MoveType.PRIME:
 		px, py = bs.player_worker.get_location()
 		sr = space_run(bs, px, py, m.direction)
-		val += 4.0 + 1.2 * sr
+		val += 1.8 + 0.7 * sr
 	else:
 		val += 1.0
 	return val
@@ -388,6 +401,9 @@ class PlayerAgent:
 
 		depth = 3
 		max_branch = 10 if turns_left > 8 else 12
+		if time_left_seconds <= LOW_TIME_SHALLOW_SECONDS:
+			depth = 2
+			max_branch = 8
 		if (turns_left <= CLUTCH_TURNS or abs(score_gap) <= CLUTCH_GAP) and time_left_seconds > 35:
 			depth = CLUTCH_AB_DEPTH
 			max_branch = 8 if turns_left > 8 else 10
@@ -404,6 +420,14 @@ class PlayerAgent:
 			board_after = bs.forecast_move(m, check_ok=True)
 			if board_after is None:
 				continue
+
+			# Hard safety gate: avoid trap-prime moves unless they clearly convert soon.
+			if m.move_type == MoveType.PRIME:
+				mob_after = len(board_after.get_valid_moves(exclude_search=True))
+				my_near_carpet = immediate_carpet_value(board_after)
+				if mob_after <= NO_PRIME_MOBILITY_CUTOFF and my_near_carpet < NO_PRIME_CARPET_EXCEPTION:
+					continue
+
 			opp_threat = immediate_carpet_value_enemy(board_after)
 
 			# If trailing, bias less toward threat-avoidance to seek comeback lines.
@@ -418,6 +442,13 @@ class PlayerAgent:
 			child.reverse_perspective()
 			val = -self._negamax(child, depth - 1, -beta, -alpha, max_branch)
 			val -= root_threat_weight * opp_threat
+
+			# Extra root safeguard: avoid prime moves that trap us without near conversion.
+			if m.move_type == MoveType.PRIME:
+				mob_after = len(board_after.get_valid_moves(exclude_search=True))
+				my_near_carpet = immediate_carpet_value(board_after)
+				if mob_after <= 2 and my_near_carpet <= 0:
+					val -= TRAP_PRIME_ROOT_PENALTY
 			if val > best_val:
 				best_val = val
 				best_move = m
@@ -464,6 +495,37 @@ class PlayerAgent:
 		):
 			self.prev_action_type = best_carpet.move_type
 			return best_carpet
+
+		# Hard low-time safety: no deep search, use fastest greedy policy.
+		if time_left_seconds <= LOW_TIME_GREEDY_SECONDS:
+			start = bs.player_worker.get_location()
+			near_cash = best_nearby_carpet_option(bs, start, turns_left)
+			if near_cash is not None:
+				if near_cash["steps"] == 0:
+					c = Move.carpet(near_cash["direction"], near_cash["roll"])
+					if bs.is_valid_move(c):
+						self.prev_action_type = c.move_type
+						return c
+				else:
+					d = next_step_toward(bs, start, near_cash["cell"])
+					if d is not None:
+						c = Move.plain(d)
+						if bs.is_valid_move(c):
+							self.prev_action_type = c.move_type
+							return c
+
+			moves = bs.get_valid_moves(exclude_search=True)
+			if moves:
+				for m in moves:
+					if m.move_type == MoveType.CARPET and bs.is_valid_move(m):
+						self.prev_action_type = m.move_type
+						return m
+				for m in moves:
+					if m.move_type == MoveType.PLAIN and bs.is_valid_move(m):
+						self.prev_action_type = m.move_type
+						return m
+				self.prev_action_type = moves[0].move_type
+				return moves[0]
 
 		# Always secure nearby carpet points before broader planning.
 		start = bs.player_worker.get_location()
@@ -525,6 +587,10 @@ class PlayerAgent:
 		# Very rare fallback.
 		moves = bs.get_valid_moves(exclude_search=True)
 		if moves:
+			for m in moves:
+				if m.move_type == MoveType.CARPET and bs.is_valid_move(m):
+					self.prev_action_type = m.move_type
+					return m
 			self.prev_action_type = moves[0].move_type
 			return moves[0]
 
