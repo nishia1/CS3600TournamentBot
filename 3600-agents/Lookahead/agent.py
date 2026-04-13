@@ -105,6 +105,92 @@ def _best_carpet_move(bs):
     return best_move
 
 
+def _carpet_points(roll_len):
+    capped = min(max(1, int(roll_len)), BOARD_SIZE - 1)
+    return CARPET_POINTS_TABLE.get(capped, 0)
+
+
+def _distance_multiplier(steps):
+    # Multiply value by a distance term so closer opportunities are preferred.
+    return 1.0 / (steps + 1.0)
+
+
+def _all_carpet_options(bs, start):
+    dist = _bfs(bs, start)
+    if start not in dist:
+        dist[start] = 0
+
+    options = []
+    for (x, y), steps in dist.items():
+        for d in DIRS:
+            roll = _primed_run(bs, x, y, d)
+            if roll < 1:
+                continue
+            points = _carpet_points(roll)
+            options.append({
+                "kind": "carpet",
+                "cell": (x, y),
+                "direction": d,
+                "roll": roll,
+                "steps": steps,
+                "points": points,
+            })
+    return options
+
+
+def _all_prime_options(bs, start, belief):
+    dist = _bfs(bs, start)
+    if start not in dist:
+        dist[start] = 0
+
+    options = []
+    for (x, y), steps in dist.items():
+        if bs.get_cell((x, y)) != Cell.SPACE:
+            continue
+        for d in DIRS:
+            run = _space_run(bs, x, y, d)
+            if run < 2:
+                continue
+
+            rat_mass = 0.0
+            cx, cy = x, y
+            for _ in range(run):
+                cx, cy = _step(cx, cy, d)
+                rat_mass += float(belief[_idx(cx, cy)])
+
+            points = _carpet_points(run)
+            options.append({
+                "kind": "prime",
+                "cell": (x, y),
+                "direction": d,
+                "run": run,
+                "steps": steps,
+                "points": points,
+                "rat_mass": rat_mass,
+            })
+    return options
+
+
+def _best_distance_weighted_option(carpet_options, prime_options):
+    best = None
+
+    for o in carpet_options:
+        base_value = o["points"] * 3.0 + o["roll"]
+        score = base_value * _distance_multiplier(o["steps"])
+        candidate = {"score": score, **o}
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    for o in prime_options:
+        base_value = o["points"] * 2.0 + o["rat_mass"] * 3.0
+        score = base_value * _distance_multiplier(o["steps"])
+        candidate = {"score": score, **o}
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    return best
+
+
 def _standard_passable(bs, nx, ny):
     if not bs.is_valid_cell((nx, ny)):
         return False
@@ -250,7 +336,7 @@ class PlayerAgent:
         self.prime_run_len = 0
 
     def commentate(self):
-        return "commit prime carpet hunter"
+        return "global prime/carpet optimizer"
 
     def play(self, bs, sensor, time_left):
         noise_idx, dist = sensor
@@ -267,16 +353,7 @@ class PlayerAgent:
         current_cell = bs.get_cell((px, py))
         turns_left = bs.player_worker.turns_left
 
-        # ── 1. CARPET immediately if profitable ───────────────────────────────
-        carpet = _best_carpet_move(bs)
-        if carpet is not None:
-            self.prime_dir = None
-            self.prime_remaining = 0
-            self.prime_run_start = None
-            return carpet
-
-        # ── 2. CONTINUE prime run — highest priority after carpet ─────────────
-        # Once committed to a prime run, finish it no matter what.
+        # 1) Continue committed prime run first.
         if self.prime_dir is not None and self.prime_remaining > 0:
             c = Move.prime(self.prime_dir)
             if bs.is_valid_move(c):
@@ -290,55 +367,59 @@ class PlayerAgent:
                 self.prime_remaining = 0
                 self.prime_run_start = None
 
-        # ── 3. START a new prime run if on SPACE ──────────────────────────────
-        if current_cell == Cell.SPACE:
-            best_d, best_r = _pick_prime_direction(bs, belief)
-            if best_d is not None:
-                c = Move.prime(best_d)
-                if bs.is_valid_move(c):
-                    self.prime_dir = best_d
-                    self.prime_remaining = best_r - 1
-                    self.prime_run_start = (px, py)
-                    self.prime_run_len = best_r
-                    return c
+        # 2) Evaluate all reachable carpet and prime opportunities.
+        start = (px, py)
+        carpet_options = _all_carpet_options(bs, start)
+        prime_options = _all_prime_options(bs, start, belief)
+        best_option = _best_distance_weighted_option(carpet_options, prime_options)
 
-        # ── 4. SEARCH if high EV and not mid-prime ────────────────────────────
-        # Only search when we have nothing better to do (no prime run available)
+        if best_option is not None:
+            if best_option["kind"] == "carpet":
+                if best_option["steps"] == 0:
+                    c = Move.carpet(best_option["direction"], best_option["roll"])
+                    if bs.is_valid_move(c):
+                        self.prime_dir = None
+                        self.prime_remaining = 0
+                        self.prime_run_start = None
+                        return c
+                else:
+                    d = _next_step_toward(bs, start, best_option["cell"])
+                    if d is not None:
+                        c = Move.plain(d)
+                        if bs.is_valid_move(c):
+                            return c
+
+            if best_option["kind"] == "prime":
+                if best_option["steps"] == 0 and current_cell == Cell.SPACE:
+                    c = Move.prime(best_option["direction"])
+                    if bs.is_valid_move(c):
+                        self.prime_dir = best_option["direction"]
+                        self.prime_remaining = best_option["run"] - 1
+                        self.prime_run_start = start
+                        self.prime_run_len = best_option["run"]
+                        return c
+                else:
+                    d = _next_step_toward(bs, start, best_option["cell"])
+                    if d is not None:
+                        c = Move.plain(d)
+                        if bs.is_valid_move(c):
+                            return c
+
+        # 3) Search when no high-value board action is available.
         if self.search_cd == 0:
             loc, ev = _best_search(belief, bs)
             if ev > 1.5:
                 self.search_cd = 3
                 return Move.search(loc)
 
-        # ── 5. MOVE toward best space destination for priming ─────────────────
-        target = _find_best_space_destination(bs, belief)
-        if target is not None and target != (px, py):
-            d = _next_step_toward(bs, (px, py), target)
-            if d is not None:
-                # If we're on space and moving to space, prime on the way
-                # only if this direction itself has a long run
-                if current_cell == Cell.SPACE:
-                    sr = _space_run(bs, px, py, d)
-                    if sr >= 2:
-                        c = Move.prime(d)
-                        if bs.is_valid_move(c):
-                            self.prime_dir = d
-                            self.prime_remaining = sr - 1
-                            self.prime_run_start = (px, py)
-                            self.prime_run_len = sr
-                            return c
-                c = Move.plain(d)
-                if bs.is_valid_move(c):
-                    return c
-
-        # ── 6. Search at lower EV threshold if truly stuck ────────────────────
+        # 4) Search at lower EV threshold if truly stuck.
         if self.search_cd == 0:
             loc, ev = _best_search(belief, bs)
             if ev > 0:
                 self.search_cd = 3
                 return Move.search(loc)
 
-        # ── 7. Fallback: any valid move ───────────────────────────────────────
+        # 5) Fallback: any valid move.
         moves = bs.get_valid_moves(exclude_search=True)
         if moves:
             for m in moves:
