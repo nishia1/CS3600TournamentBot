@@ -1,1 +1,2 @@
 # CS3600TournamentBot
+WE WILL BEAT CARRIE
