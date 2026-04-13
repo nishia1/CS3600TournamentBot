@@ -47,6 +47,12 @@ TACTICAL_BAD_PRIME_PENALTY = 6.0
 TACTICAL_PLAIN_GAP_PENALTY = 0.2
 TACTICAL_MIN_SCORE = 2.5
 CARPET_PLAN_MIN_POINTS = 3
+TACTICAL_CARPET_BONUS = 6.5
+PRESSURE_TRAIL_POINTS = 3
+PRESSURE_ENDGAME_TURNS = 12
+DEFEND_MIN_POINTS = 3
+DEFEND_THREAT_WINDOW = 1
+DEFEND_URGENCY_WEIGHT = 2.0
 
 def _loc(i):        return (i % BOARD_SIZE, i // BOARD_SIZE)
 def _idx(x, y):     return y * BOARD_SIZE + x
@@ -179,6 +185,11 @@ def _estimate_best_alt_value(bs, start):
         s = steal["points"] * 3.8 / (steal["steps"] + 1.0) + steal["roll"] * 0.5
         best = max(best, s)
 
+    defend = _best_defend_option(bs, start)
+    if defend is not None:
+        s = defend["points"] * 4.1 / (defend["steps"] + 1.0) + defend["roll"] * 0.6
+        best = max(best, s)
+
     for o in _all_carpet_options(bs, start):
         s = o["points"] * 3.2 / (o["steps"] + 1.0) + o["roll"] * 0.5
         best = max(best, s)
@@ -186,17 +197,34 @@ def _estimate_best_alt_value(bs, start):
     return best
 
 
-def _best_reachable_carpet_option(bs, start, turns_left):
+def _best_reachable_carpet_option(bs, start, turns_left, min_points=CARPET_PLAN_MIN_POINTS, prefer_contested=False):
     options = _all_carpet_options(bs, start)
+    ox, oy = bs.opponent_worker.get_location()
+    opp_dist = _bfs_avoiding(bs, (ox, oy), start)
     best = None
     best_score = -1e9
     for o in options:
-        if o["points"] < CARPET_PLAN_MIN_POINTS:
+        if o["points"] < min_points:
             continue
         # Need at least steps to reach + one carpet turn.
         if turns_left < o["steps"] + 1:
             continue
-        score = o["points"] * 4.0 + o["roll"] * 0.8 - o["steps"] * 1.2
+
+        them = opp_dist.get(o["cell"], 99)
+        race_margin = them - o["steps"]
+        urgency = 0.0
+        if them <= o["steps"] + 1:
+            urgency = (o["steps"] + 1 - them) * 2.0
+
+        score = (
+            o["points"] * 4.0
+            + o["roll"] * 0.8
+            - o["steps"] * 1.2
+            + race_margin * 0.9
+            + urgency
+        )
+        if prefer_contested and them <= o["steps"] + 1:
+            score += 2.0
         if score > best_score:
             best_score = score
             best = o
@@ -239,6 +267,9 @@ def _best_tactical_move(bs, turns_left):
         score += _carpet_points(max_roll) * TACTICAL_FUTURE_CARPET_WEIGHT
         score += _control_open_score(nxt, nx, ny) * TACTICAL_CONTROL_WEIGHT
         score += (abs(nx - ox) + abs(ny - oy)) * TACTICAL_OPP_DIST_WEIGHT
+
+        if m.move_type == MoveType.CARPET:
+            score += TACTICAL_CARPET_BONUS
 
         if m.move_type == MoveType.PRIME and not _prime_time_feasible(turns_left, 0, max(1, max_roll)):
             score -= TACTICAL_BAD_PRIME_PENALTY
@@ -416,6 +447,44 @@ def _best_steal_option(bs, start):
     return best
 
 
+def _best_defend_option(bs, start):
+    """
+    Identify valuable carpet opportunities that are threatened by opponent arrival.
+    """
+    carpet_options = _all_carpet_options(bs, start)
+    if not carpet_options:
+        return None
+
+    ox, oy = bs.opponent_worker.get_location()
+    opp_dist = _bfs_avoiding(bs, (ox, oy), start)
+
+    best = None
+    best_score = -1e9
+    for o in carpet_options:
+        if o["points"] < DEFEND_MIN_POINTS:
+            continue
+
+        us = o["steps"]
+        them = opp_dist.get(o["cell"], 99)
+
+        # Threatened if opponent can arrive now or soon.
+        if them > us + DEFEND_THREAT_WINDOW:
+            continue
+
+        urgency = max(0, us + DEFEND_THREAT_WINDOW - them)
+        score = (
+            o["points"] * 4.2
+            + o["roll"] * 1.2
+            + urgency * DEFEND_URGENCY_WEIGHT
+            - us * 0.8
+        )
+        if score > best_score:
+            best_score = score
+            best = o
+
+    return best
+
+
 def _standard_passable(bs, nx, ny):
     if not bs.is_valid_cell((nx, ny)):
         return False
@@ -463,7 +532,7 @@ def _bfs_avoiding(bs, start, avoid_loc):
     return dist
 
 
-def _next_step_toward(bs, start, target):
+def _next_step_toward(bs, start, target, avoid=None):
     if start == target:
         return None
     prev = {start: None}
@@ -476,6 +545,8 @@ def _next_step_toward(bs, start, target):
         for d in DIRS:
             nx, ny = _step(cx, cy, d)
             if (nx, ny) in prev:
+                continue
+            if avoid is not None and (nx, ny) == avoid and (cx, cy) == start:
                 continue
             if _standard_passable(bs, nx, ny):
                 prev[(nx, ny)] = ((cx, cy), d)
@@ -640,6 +711,11 @@ class PlayerAgent:
         self.no_gain_turns = 0
         self.control_target = None
         self.control_target_age = 0
+        self.prev_pos = None
+
+    def _ret(self, current_pos, move):
+        self.prev_pos = current_pos
+        return move
 
     def commentate(self):
         return "global prime/carpet optimizer"
@@ -658,13 +734,24 @@ class PlayerAgent:
         px, py = bs.player_worker.get_location()
         current_cell = bs.get_cell((px, py))
         turns_left = bs.player_worker.turns_left
+        my_points = bs.player_worker.get_points()
+        opp_points = bs.opponent_worker.get_points()
+
+        if my_points > self.last_points:
+            self.no_gain_turns = 0
+        else:
+            self.no_gain_turns += 1
+        self.last_points = my_points
+
+        score_gap = my_points - opp_points
+        pressure_mode = (turns_left <= PRESSURE_ENDGAME_TURNS) or (score_gap <= -PRESSURE_TRAIL_POINTS)
         # 1) Carpet immediately if profitable.
         carpet = _best_carpet_move(bs)
         if carpet is not None:
             self.prime_dir = None
             self.prime_remaining = 0
             self.prime_run_start = None
-            return carpet
+            return self._ret((px, py), carpet)
 
         # 1.5) Steal/deny valuable primed lanes before opponent can convert.
         steal = _best_steal_option(bs, (px, py))
@@ -677,17 +764,46 @@ class PlayerAgent:
                     self.prime_run_start = None
                     self.control_target = None
                     self.control_target_age = 0
-                    return c
+                    return self._ret((px, py), c)
             else:
-                d = _next_step_toward(bs, (px, py), steal["cell"])
+                d = _next_step_toward(bs, (px, py), steal["cell"], avoid=self.prev_pos)
+                if d is None:
+                    d = _next_step_toward(bs, (px, py), steal["cell"])
                 if d is not None:
                     # When racing to steal, prefer arriving quickly over creating more primed residue.
                     c = Move.plain(d)
                     if bs.is_valid_move(c):
-                        return c
+                        return self._ret((px, py), c)
+
+        # 1.6) Defend threatened primed lanes from being stolen.
+        defend = _best_defend_option(bs, (px, py))
+        if defend is not None:
+            if defend["steps"] == 0:
+                c = Move.carpet(defend["direction"], defend["roll"])
+                if bs.is_valid_move(c):
+                    self.prime_dir = None
+                    self.prime_remaining = 0
+                    self.prime_run_start = None
+                    return self._ret((px, py), c)
+            else:
+                d = _next_step_toward(bs, (px, py), defend["cell"], avoid=self.prev_pos)
+                if d is None:
+                    d = _next_step_toward(bs, (px, py), defend["cell"])
+                if d is not None:
+                    # Rush to conversion point; don't lay extra prime while defending.
+                    c = Move.plain(d)
+                    if bs.is_valid_move(c):
+                        return self._ret((px, py), c)
 
         # 1.75) If there are good reachable carpets, route toward converting them.
-        carpet_plan = _best_reachable_carpet_option(bs, (px, py), turns_left)
+        plan_min_points = 2 if pressure_mode else CARPET_PLAN_MIN_POINTS
+        carpet_plan = _best_reachable_carpet_option(
+            bs,
+            (px, py),
+            turns_left,
+            min_points=plan_min_points,
+            prefer_contested=pressure_mode,
+        )
         if carpet_plan is not None:
             if carpet_plan["steps"] == 0:
                 c = Move.carpet(carpet_plan["direction"], carpet_plan["roll"])
@@ -695,13 +811,15 @@ class PlayerAgent:
                     self.prime_dir = None
                     self.prime_remaining = 0
                     self.prime_run_start = None
-                    return c
+                    return self._ret((px, py), c)
             else:
-                d = _next_step_toward(bs, (px, py), carpet_plan["cell"])
+                d = _next_step_toward(bs, (px, py), carpet_plan["cell"], avoid=self.prev_pos)
+                if d is None:
+                    d = _next_step_toward(bs, (px, py), carpet_plan["cell"])
                 if d is not None:
                     c = Move.plain(d)
                     if bs.is_valid_move(c):
-                        return c
+                        return self._ret((px, py), c)
 
         # 2) Continue committed prime run.
         if self.prime_dir is not None and self.prime_remaining > 0:
@@ -725,7 +843,7 @@ class PlayerAgent:
                         self.prime_remaining -= 1
                         if self.prime_remaining == 0:
                             self.prime_dir = None
-                        return c
+                        return self._ret((px, py), c)
                     else:
                         self.prime_dir = None
                         self.prime_remaining = 0
@@ -733,20 +851,12 @@ class PlayerAgent:
 
         # 2.5) Tactical one-turn choice to reduce sporadic behavior.
         tactical_move, tactical_score = _best_tactical_move(bs, turns_left)
-        if tactical_move is not None and tactical_score >= TACTICAL_MIN_SCORE:
-            if tactical_move.move_type == MoveType.PRIME:
-                # If this is a committed tactical prime, track remaining run.
-                if tactical_move.direction is not None:
-                    sr = _space_run(bs, px, py, tactical_move.direction)
-                    if sr >= 2:
-                        self.prime_dir = tactical_move.direction
-                        self.prime_remaining = sr - 1
-                        self.prime_run_start = (px, py)
-                        self.prime_run_len = sr
-                    else:
-                        self.prime_dir = None
-                        self.prime_remaining = 0
-            return tactical_move
+        if (
+            tactical_move is not None
+            and tactical_score >= TACTICAL_MIN_SCORE
+            and tactical_move.move_type == MoveType.CARPET
+        ):
+            return self._ret((px, py), tactical_move)
 
         # 3) Start a strong prime run if on SPACE.
         if current_cell == Cell.SPACE:
@@ -764,14 +874,15 @@ class PlayerAgent:
                             self.prime_remaining = 0
                         self.prime_run_start = (px, py)
                         self.prime_run_len = best_r
-                        return c
+                        return self._ret((px, py), c)
 
         # 4) Search when EV is high.
         if self.search_cd == 0:
             loc, ev = _best_search(belief, bs)
-            if ev > 1.35:
+            high_search_threshold = 1.15 if pressure_mode else 1.8
+            if ev > high_search_threshold:
                 self.search_cd = 3
-                return Move.search(loc)
+                return self._ret((px, py), Move.search(loc))
 
         # 5) Move toward best prime-building space destination.
         # Keep a stable board-control target for several turns.
@@ -791,7 +902,9 @@ class PlayerAgent:
             self.control_target_age = 0
 
         if target is not None and target != (px, py):
-            d = _next_step_toward(bs, (px, py), target)
+            d = _next_step_toward(bs, (px, py), target, avoid=self.prev_pos)
+            if d is None:
+                d = _next_step_toward(bs, (px, py), target)
             if d is not None:
                 if current_cell == Cell.SPACE:
                     sr = _space_run(bs, px, py, d)
@@ -807,10 +920,10 @@ class PlayerAgent:
                                 self.prime_remaining = 0
                             self.prime_run_start = (px, py)
                             self.prime_run_len = sr
-                            return c
+                            return self._ret((px, py), c)
                 c = Move.plain(d)
                 if bs.is_valid_move(c):
-                    return c
+                    return self._ret((px, py), c)
 
         if target == (px, py):
             self.control_target = None
@@ -819,20 +932,21 @@ class PlayerAgent:
         # 6) Lower-threshold search if stuck.
         if self.search_cd == 0:
             loc, ev = _best_search(belief, bs)
-            if ev > 0.4:
+            low_search_threshold = 0.35 if (pressure_mode and self.no_gain_turns >= 10) else 0.8
+            if ev > low_search_threshold and self.no_gain_turns >= 10:
                 self.search_cd = 3
-                return Move.search(loc)
+                return self._ret((px, py), Move.search(loc))
 
         # 7) Fallback: any valid move.
         moves = bs.get_valid_moves(exclude_search=True)
         if moves:
             for m in moves:
                 if m.move_type == MoveType.PRIME and bs.is_valid_move(m):
-                    return m
+                    return self._ret((px, py), m)
             for m in moves:
                 if m.move_type == MoveType.PLAIN and bs.is_valid_move(m):
-                    return m
-            return moves[0]
+                    return self._ret((px, py), m)
+            return self._ret((px, py), moves[0])
 
         loc, _ = _best_search(belief, bs)
-        return Move.search(loc)
+        return self._ret((px, py), Move.search(loc))
