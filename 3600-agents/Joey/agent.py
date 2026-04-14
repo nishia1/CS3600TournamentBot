@@ -456,6 +456,7 @@ class PlayerAgent:
 
 		return best_move
 
+	# bs: board object, sensor: sensor object for rat (?), time_left is
 	def play(self, bs, sensor, time_left):
 		# RL update from realized reward since our last action.
 		self._update_rl(bs)
