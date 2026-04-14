@@ -1,1 +1,6 @@
 /.idea
+/3600-agents/Cassie/cassie_rl_state.json
+/3600-agents/matches/*.json
+/3600-agents/matches/*.csv
+/3600-agents/matches/*.log
+/3600-agents/matches/*.txt
