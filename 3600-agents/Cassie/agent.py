@@ -23,12 +23,19 @@ LOW_TIME_SHALLOW_SECONDS = 20.0
 ENDGAME_CONVERT_TURNS = 16
 CLUTCH_TURNS = 10
 CLUTCH_GAP = 8
+RUSH_CARPET_MAX_STEPS = 3
+RUSH_CARPET_MIN_POINTS = 4
 
 CONTEST_MIN_POINTS = 3
 ROOT_OPP_THREAT_WEIGHT = 2.8
 NO_PRIME_MOBILITY_CUTOFF = 1
 NO_PRIME_CARPET_EXCEPTION = 4
+ROOT_RESPONSE_WEIGHT = 0.85
+SEARCH_BELIEF_MIN = 0.58
 RL_STATE_FILE = "cassie_rl_state.json"
+
+_SEARCH_TT = {}
+_REPLY_TT = {}
 
 # Submission mode: use fixed tuned constants and avoid runtime file I/O.
 SUBMISSION_MODE = True
@@ -108,6 +115,12 @@ class RatHMM:
 
 	def predict(self):
 		self.b = self.b @ self.T
+		self.b = np.nan_to_num(self.b, nan=0.0, posinf=0.0, neginf=0.0)
+		s = float(self.b.sum())
+		if s > 1e-12:
+			self.b /= s
+		else:
+			self.b = np.ones(N, dtype=np.float64) / N
 
 	def update(self, bs, noise_idx, dist):
 		wx, wy = bs.player_worker.get_location()
@@ -129,13 +142,21 @@ class RatHMM:
 		s = like.sum()
 		if s > 1e-12:
 			self.b = self.b * like
-			self.b /= self.b.sum()
+			total = float(self.b.sum())
+			if total > 1e-12 and np.isfinite(total):
+				self.b /= total
+			else:
+				self.b = np.ones(N, dtype=np.float64) / N
 		else:
 			mask = np.array([
 				0.0 if bs.get_cell(loc_i(i)) == Cell.BLOCKED else 1.0
 				for i in range(N)
 			], dtype=np.float64)
-			self.b = mask / mask.sum()
+			ms = float(mask.sum())
+			if ms > 1e-12:
+				self.b = mask / ms
+			else:
+				self.b = np.ones(N, dtype=np.float64) / N
 
 
 def primed_run(bs, x, y, d):
@@ -152,21 +173,24 @@ def primed_run(bs, x, y, d):
 	return r
 
 
-def space_run(bs, x, y, d):
-	ox, oy = bs.opponent_worker.get_location()
+def space_run_to(bs, x, y, d, stop_loc):
 	r = 0
 	cx, cy = x, y
 	while True:
 		cx, cy = step_xy(cx, cy, d)
 		if not bs.is_valid_cell((cx, cy)):
 			break
-		if (cx, cy) == (ox, oy):
+		if (cx, cy) == stop_loc:
 			break
 		if bs.get_cell((cx, cy)) == Cell.SPACE:
 			r += 1
 		else:
 			break
 	return r
+
+
+def space_run(bs, x, y, d):
+	return space_run_to(bs, x, y, d, bs.opponent_worker.get_location())
 
 
 def immediate_carpet_value(bs):
@@ -213,6 +237,52 @@ def open_neighbors(bs, pos):
 		if bs.get_cell((nx, ny)) != Cell.BLOCKED:
 			c += 1
 	return c
+
+
+def cell_potential(bs, pos):
+	return cell_potential_for(bs, pos, bs.opponent_worker.get_location())
+
+
+def cell_potential_for(bs, pos, stop_loc):
+	x, y = pos
+	if not bs.is_valid_cell((x, y)):
+		return 0.0
+	cell = bs.get_cell((x, y))
+	if cell == Cell.BLOCKED:
+		return 0.0
+
+	best = 0.0
+	for d in DIRS:
+		if cell == Cell.PRIMED:
+			r = primed_run(bs, x, y, d)
+		else:
+			r = space_run_to(bs, x, y, d, stop_loc)
+		if r < 2:
+			continue
+		points = CARPET_POINTS_TABLE.get(min(r, BOARD_SIZE - 1), 0)
+		best = max(best, points + 0.7 * carpet_roll_bonus(r))
+	return best
+
+
+def best_reachable_potential(bs, start):
+	return best_reachable_potential_for(bs, start, bs.opponent_worker.get_location())
+
+
+def best_reachable_potential_for(bs, start, stop_loc):
+	dist = bfs_dist(bs, start)
+	best_score = 0.0
+	best_cell = None
+	best_steps = 0
+	for pos, steps in dist.items():
+		pot = cell_potential_for(bs, pos, stop_loc)
+		if pot <= 0.0:
+			continue
+		score = pot / ((steps + 1.0) ** 0.92)
+		if score > best_score:
+			best_score = score
+			best_cell = pos
+			best_steps = steps
+	return best_cell, best_steps, best_score
 
 
 def standard_passable(bs, nx, ny):
@@ -303,7 +373,17 @@ def all_carpet_options(bs, start):
 	return options
 
 
-def best_nearby_carpet_option(bs, start, turns_left):
+def carpet_roll_bonus(roll):
+	# Push strategy toward long carpets that are worth disproportionately more points.
+	bonus = 0.0
+	if roll >= 4:
+		bonus += (roll - 3) * 2.4
+	if roll >= 6:
+		bonus += (roll - 5) * 3.6
+	return bonus
+
+
+def best_nearby_carpet_option(bs, start, turns_left, max_steps=1, min_points=1):
 	options = all_carpet_options(bs, start)
 	if not options:
 		return None
@@ -311,13 +391,13 @@ def best_nearby_carpet_option(bs, start, turns_left):
 	best = None
 	best_score = -1e9
 	for o in options:
-		if o["points"] < 1:
+		if o["points"] < min_points:
 			continue
-		if o["steps"] > 1:
+		if o["steps"] > max_steps:
 			continue
 		if turns_left < o["steps"] + 1:
 			continue
-		score = o["points"] * 6.0 + o["roll"] * 1.1 - o["steps"] * 2.8
+		score = o["points"] * 6.0 + o["roll"] * 1.2 + carpet_roll_bonus(o["roll"]) - o["steps"] * 2.5
 		if o["steps"] == 0:
 			score += 4.0
 		if score > best_score:
@@ -341,7 +421,7 @@ def best_reachable_carpet_option(bs, start, turns_left, min_points=3):
 			continue
 		them = opp_dist.get(o["cell"], 99)
 		race_margin = them - o["steps"]
-		score = o["points"] * 4.2 + o["roll"] * 0.8 - o["steps"] * 1.0 + race_margin * 0.8
+		score = o["points"] * 4.3 + o["roll"] * 0.8 + carpet_roll_bonus(o["roll"]) - o["steps"] * 0.9 + race_margin * 0.9
 		if score > best_score:
 			best_score = score
 			best = o
@@ -364,30 +444,89 @@ def best_contested_carpet_option(bs, start, min_points=CONTEST_MIN_POINTS):
 		if us > them + 1:
 			continue
 		race = them - us
-		s = o["points"] * 4.7 + o["roll"] * 0.8 + race * 1.2 - us * 0.7
+		s = o["points"] * 4.8 + o["roll"] * 0.9 + carpet_roll_bonus(o["roll"]) + race * 1.3 - us * 0.65
 		if s > best_score:
 			best_score = s
 			best = o
 	return best
 
 
-def evaluate(bs, belief):
+def conservative_eval(bs):
 	my_pts = bs.player_worker.get_points()
 	op_pts = bs.opponent_worker.get_points()
-	score = 8.4 * (my_pts - op_pts)
+	score = 8.0 * (my_pts - op_pts)
 
 	my_immediate = immediate_carpet_value(bs)
 	op_immediate = immediate_carpet_value_enemy(bs)
-	score += 2.7 * my_immediate
-	score -= 3.0 * op_immediate
+	score += 2.5 * my_immediate
+	score -= 3.2 * op_immediate
+
+	px, py = bs.player_worker.get_location()
+	ox, oy = bs.opponent_worker.get_location()
+	if bs.get_cell((px, py)) == Cell.SPACE:
+		best_prime = 0
+		for d in DIRS:
+			r = space_run(bs, px, py, d)
+			if r >= 2:
+				best_prime = max(best_prime, CARPET_POINTS_TABLE.get(min(r, BOARD_SIZE - 1), 0))
+		score += 0.9 * best_prime
+
+	score += 0.2 * (abs(px - ox) + abs(py - oy))
+	score += 0.6 * open_neighbors(bs, (px, py))
+
+	mobility = len(bs.get_valid_moves(exclude_search=True))
+	score += 0.5 * mobility
+	if mobility <= 2:
+		score -= 3.5
+	if mobility <= 1:
+		score -= 8.0
+	return score
+
+
+def evaluate(bs, belief):
+	my_pts = bs.player_worker.get_points()
+	op_pts = bs.opponent_worker.get_points()
+	turns_left = bs.player_worker.turns_left
+	if turns_left > 28:
+		point_weight = 8.1
+		mobility_weight = 0.72
+		threat_weight = 2.7
+	elif turns_left > 14:
+		point_weight = 9.8
+		mobility_weight = 0.60
+		threat_weight = 3.1
+	else:
+		point_weight = 11.0
+		mobility_weight = 0.48
+		threat_weight = 3.6
+
+	score = point_weight * (my_pts - op_pts)
+
+	my_immediate = immediate_carpet_value(bs)
+	op_immediate = immediate_carpet_value_enemy(bs)
+	score += 1.55 * my_immediate
+	score -= threat_weight * op_immediate
 
 	px, py = bs.player_worker.get_location()
 	ox, oy = bs.opponent_worker.get_location()
 	score += 0.45 * open_neighbors(bs, (px, py))
 	score += 0.18 * (abs(px - ox) + abs(py - oy))
 
+	my_potential = cell_potential(bs, (px, py))
+	best_cell, best_steps, best_potential = best_reachable_potential(bs, (px, py))
+	opp_best_cell, opp_best_steps, opp_best_potential = best_reachable_potential_for(bs, (ox, oy), (px, py))
+	score += 1.0 * my_potential
+	score += 0.95 * best_potential
+	score -= 1.5 * opp_best_potential
+	if best_cell is not None:
+		score += 0.25 * open_neighbors(bs, best_cell)
+		score -= 0.12 * best_steps
+	if opp_best_cell is not None:
+		score -= 0.18 * open_neighbors(bs, opp_best_cell)
+		score += 0.10 * opp_best_steps
+
 	mobility = len(bs.get_valid_moves(exclude_search=True))
-	score += 0.7 * mobility
+	score += mobility_weight * mobility
 	if mobility <= 2:
 		score -= 4.0
 	if mobility <= 1:
@@ -400,24 +539,70 @@ def evaluate(bs, belief):
 	d = abs(px - bx) + abs(py - by)
 	score += 1.6 * best_p / (1.0 + d)
 
-	return score
+	cons = conservative_eval(bs)
+	return 0.74 * score + 0.26 * cons
 
 
 def move_heuristic(bs, m, belief, action_bias):
 	px, py = bs.player_worker.get_location()
 	val = 0.35 * float(action_bias.get(m.move_type, 0.0))
 	if m.move_type == MoveType.CARPET:
-		val += 20.0 + 2.1 * m.roll_length
+		cx, cy = px, py
+		for _ in range(m.roll_length):
+			cx, cy = step_xy(cx, cy, m.direction)
+		val += 20.0 + 2.1 * m.roll_length + 0.8 * carpet_roll_bonus(m.roll_length)
+		val += 0.9 * cell_potential(bs, (cx, cy))
+		val += 0.2 * open_neighbors(bs, (cx, cy))
 	elif m.move_type == MoveType.PRIME:
 		sr = space_run(bs, px, py, m.direction)
-		val += 2.0 + 0.8 * sr
+		nx, ny = step_xy(px, py, m.direction)
+		val += 2.0 + 0.9 * sr + 0.8 * CARPET_POINTS_TABLE.get(min(sr, BOARD_SIZE - 1), 0)
+		if bs.is_valid_cell((nx, ny)):
+			val += 0.8 * cell_potential(bs, (nx, ny))
 	elif m.move_type == MoveType.PLAIN:
 		nx, ny = step_xy(px, py, m.direction)
 		if bs.is_valid_cell((nx, ny)):
-			val += 1.0 + 2.2 * float(belief[idx_xy(nx, ny)])
+			next_potential = cell_potential(bs, (nx, ny))
+			val += 0.7 + 2.0 * float(belief[idx_xy(nx, ny)]) + 0.75 * next_potential
+			if next_potential < 2.0:
+				val -= 1.1
 	else:
-		val += 0.5
+		val -= 1.8
 	return val
+
+
+def immediate_point_delta(bs, move):
+	child = bs.forecast_move(move, check_ok=True)
+	if child is None:
+		return -999.0
+	return float(child.player_worker.get_points() - bs.player_worker.get_points())
+
+
+def _best_reply_eval(bs, belief, action_bias, max_branch):
+	key = transposition_key(bs, belief, 1, 0)
+	if key in _REPLY_TT:
+		return _REPLY_TT[key]
+
+	moves = top_ordered_moves(bs, belief, action_bias, max_branch)
+	if not moves:
+		val = evaluate(bs, belief)
+		_REPLY_TT[key] = val
+		return val
+
+	worst = 1e18
+	for m in moves:
+		child = bs.forecast_move(m, check_ok=True)
+		if child is None:
+			continue
+		child.reverse_perspective()
+		val = evaluate(child, belief)
+		if val < worst:
+			worst = val
+
+	if worst == 1e18:
+		worst = evaluate(bs, belief)
+	_REPLY_TT[key] = worst
+	return worst
 
 
 def top_ordered_moves(bs, belief, action_bias, max_branch):
@@ -426,6 +611,38 @@ def top_ordered_moves(bs, belief, action_bias, max_branch):
 		return []
 	ordered = sorted(moves, key=lambda mv: move_heuristic(bs, mv, belief, action_bias), reverse=True)
 	return ordered[:max_branch]
+
+
+def tactical_volatility(bs):
+	my_immediate = immediate_carpet_value(bs)
+	op_immediate = immediate_carpet_value_enemy(bs)
+	mobility = len(bs.get_valid_moves(exclude_search=True))
+	return my_immediate >= 2 or op_immediate >= 2 or mobility <= 3
+
+
+def transposition_key(bs, belief, depth, extension):
+	clean_belief = np.nan_to_num(np.asarray(belief, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+	s = float(clean_belief.sum())
+	if s > 1e-12:
+		clean_belief /= s
+	belief_key = tuple(int(round(float(v) * 1000.0)) for v in clean_belief)
+	return (
+		depth,
+		extension,
+		bs.turn_count,
+		bs.is_player_a_turn,
+		bs._space_mask,
+		bs._primed_mask,
+		bs._carpet_mask,
+		bs._blocked_mask,
+		bs.player_worker.get_location(),
+		bs.opponent_worker.get_location(),
+		bs.player_worker.get_points(),
+		bs.opponent_worker.get_points(),
+		bs.player_worker.turns_left,
+		bs.opponent_worker.turns_left,
+		belief_key,
+	)
 
 
 class PlayerAgent:
@@ -629,13 +846,30 @@ class PlayerAgent:
 		child.reverse_perspective()
 		return child
 
-	def _negamax(self, bs, belief, depth, alpha, beta, deadline, max_branch):
-		if depth == 0 or bs.is_game_over() or time.perf_counter() >= deadline:
-			return evaluate(bs, belief)
+	def _negamax(self, bs, belief, depth, alpha, beta, deadline, max_branch, extension=0):
+		key = transposition_key(bs, belief, depth, extension)
+		cached = _SEARCH_TT.get(key)
+		if cached is not None:
+			return cached
+
+		if bs.is_game_over() or time.perf_counter() >= deadline:
+			val = evaluate(bs, belief)
+			_SEARCH_TT[key] = val
+			return val
+		if depth == 0:
+			if extension < 1 and tactical_volatility(bs):
+				val = self._negamax(bs, belief, 1, alpha, beta, deadline, max_branch, extension + 1)
+				_SEARCH_TT[key] = val
+				return val
+			val = evaluate(bs, belief)
+			_SEARCH_TT[key] = val
+			return val
 
 		moves = top_ordered_moves(bs, belief, self.q_type, max_branch)
 		if not moves:
-			return evaluate(bs, belief)
+			val = evaluate(bs, belief)
+			_SEARCH_TT[key] = val
+			return val
 
 		next_belief = belief @ self.hmm.T
 		best = -1e18
@@ -643,27 +877,39 @@ class PlayerAgent:
 			child = self._forecast_next(bs, m)
 			if child is None:
 				continue
-			val = -self._negamax(child, next_belief, depth - 1, -beta, -alpha, deadline, max_branch)
+			val = -self._negamax(child, next_belief, depth - 1, -beta, -alpha, deadline, max_branch, extension)
 			if val > best:
 				best = val
 			alpha = max(alpha, best)
 			if alpha >= beta:
 				break
+		_SEARCH_TT[key] = best
 		return best
 
 	def _best_move_ab(self, bs, belief, time_left_seconds, score_gap):
 		turns_left = bs.player_worker.turns_left
-		depth = 3
-		max_branch = 10 if turns_left > 8 else 12
+		depth = 5 if turns_left > 12 else 4
+		max_branch = 8 if turns_left > 8 else 10
+
+		_, pot_steps, pot_score = best_reachable_potential(bs, bs.player_worker.get_location())
+		if pot_score >= 8.0 and pot_steps <= 2 and time_left_seconds > 22:
+			depth = 5
+			max_branch = 8
+		elif pot_score >= 6.0 and pot_steps <= 3 and time_left_seconds > 30:
+			depth = 4
+			max_branch = 8
 
 		if time_left_seconds <= LOW_TIME_SHALLOW_SECONDS:
 			depth = 2
 			max_branch = 8
+		elif time_left_seconds > 65 and depth < 5 and abs(score_gap) <= 10:
+			depth = 5
+			max_branch = 7
 		if (turns_left <= CLUTCH_TURNS or abs(score_gap) <= CLUTCH_GAP) and time_left_seconds > 35:
 			depth = 4
 			max_branch = 8 if turns_left > 8 else 10
 
-		budget = 0.20 if time_left_seconds > 40 else 0.11
+		budget = 0.26 if time_left_seconds > 40 else 0.14
 		if abs(score_gap) <= 5 and turns_left <= 16 and time_left_seconds > 20:
 			budget += 0.04
 		deadline = time.perf_counter() + budget
@@ -682,6 +928,7 @@ class PlayerAgent:
 			board_after = bs.forecast_move(m, check_ok=True)
 			if board_after is None:
 				continue
+			immediate_gain = float(board_after.player_worker.get_points() - bs.player_worker.get_points())
 
 			# Trap-prime filter.
 			if m.move_type == MoveType.PRIME:
@@ -694,6 +941,20 @@ class PlayerAgent:
 			child = board_after
 			child.reverse_perspective()
 			val = -self._negamax(child, next_belief, depth - 1, -beta, -alpha, deadline, max_branch)
+
+			# Explicitly score the opponent's best immediate reply after our move.
+			reply_eval = _best_reply_eval(board_after, next_belief, self.q_type, max_branch)
+			val += ROOT_RESPONSE_WEIGHT * (reply_eval - evaluate(board_after, next_belief))
+
+			# Reward immediate scoring while keeping enough weight on denial/position.
+			if turns_left > 22:
+				val += 1.0 * immediate_gain
+			elif turns_left > 12:
+				val += 1.4 * immediate_gain
+			else:
+				val += 2.0 * immediate_gain
+			if immediate_gain <= 0 and turns_left <= 20 and score_gap <= 0:
+				val -= 1.3
 
 			# Root tactical penalty for handing over easy points.
 			threat_weight = ROOT_OPP_THREAT_WEIGHT
@@ -738,12 +999,20 @@ class PlayerAgent:
 
 		self.hmm.predict()
 		self.hmm.update(bs, noise_idx, dist)
-		belief = self.hmm.b.copy()
+		belief = np.nan_to_num(self.hmm.b.copy(), nan=0.0, posinf=0.0, neginf=0.0)
+		belief_sum = float(belief.sum())
+		if belief_sum > 1e-12:
+			belief /= belief_sum
+		else:
+			belief = np.ones(N, dtype=np.float64) / N
+		_SEARCH_TT.clear()
+		_REPLY_TT.clear()
 
 		turns_left = bs.player_worker.turns_left
 		my_points = bs.player_worker.get_points()
 		opp_points = bs.opponent_worker.get_points()
 		score_gap = my_points - opp_points
+		enemy_threat = immediate_carpet_value_enemy(bs)
 		if turns_left <= 1 or bs.is_game_over():
 			self._update_profile_after_match(score_gap)
 		mobility_now = len(bs.get_valid_moves(exclude_search=True))
@@ -751,6 +1020,7 @@ class PlayerAgent:
 		# 1) Immediate conversion if available.
 		best_carpet = None
 		best_carpet_pts = -1
+		best_carpet_roll = 0
 		px, py = bs.player_worker.get_location()
 		for d in DIRS:
 			r = primed_run(bs, px, py, d)
@@ -758,6 +1028,7 @@ class PlayerAgent:
 				pts = CARPET_POINTS_TABLE.get(min(r, BOARD_SIZE - 1), 0)
 				if pts > best_carpet_pts:
 					best_carpet_pts = pts
+					best_carpet_roll = r
 					best_carpet = Move.carpet(d, r)
 
 		if (
@@ -765,6 +1036,9 @@ class PlayerAgent:
 			and bs.is_valid_move(best_carpet)
 			and (
 				best_carpet_pts >= 3
+				or (best_carpet_pts >= 3 and (enemy_threat >= 3 or turns_left <= 20 or score_gap < 0))
+				or (best_carpet_roll >= 4 and best_carpet_pts >= 2)
+				or (best_carpet_pts >= 2 and turns_left <= 24)
 				or (best_carpet_pts >= self.convert_soft_threshold and (score_gap >= -4 or turns_left <= 24))
 				or turns_left <= self.endgame_convert_turns
 				or mobility_now <= 2
@@ -772,10 +1046,30 @@ class PlayerAgent:
 		):
 			return self._record_action(best_carpet)
 
-		# 2) Hard low-time policy.
+		# 2) Short cash route. Prefer taking real points over wandering or probing.
+		short_cash = best_reachable_carpet_option(
+			bs,
+			bs.player_worker.get_location(),
+			turns_left,
+			min_points=2 if score_gap <= 0 or turns_left <= 18 else 3,
+		)
+		short_cash_steps_cap = 2
+		if short_cash is not None and short_cash["steps"] <= short_cash_steps_cap:
+			if short_cash["steps"] == 0:
+				c = Move.carpet(short_cash["direction"], short_cash["roll"])
+				if bs.is_valid_move(c):
+					return self._record_action(c)
+			else:
+				d = next_step_toward(bs, bs.player_worker.get_location(), short_cash["cell"])
+				if d is not None:
+					c = Move.plain(d)
+					if bs.is_valid_move(c):
+						return self._record_action(c)
+
+		# 3) Hard low-time policy.
 		if time_left_seconds <= LOW_TIME_GREEDY_SECONDS:
 			start = bs.player_worker.get_location()
-			near_cash = best_nearby_carpet_option(bs, start, turns_left)
+			near_cash = best_nearby_carpet_option(bs, start, turns_left, max_steps=2, min_points=2)
 			if near_cash is not None:
 				if near_cash["steps"] == 0:
 					c = Move.carpet(near_cash["direction"], near_cash["roll"])
@@ -798,23 +1092,49 @@ class PlayerAgent:
 						return self._record_action(m)
 				return self._record_action(moves[0])
 
-		# 3) Nearby cash first.
 		start = bs.player_worker.get_location()
-		near_cash = best_nearby_carpet_option(bs, start, turns_left)
-		if near_cash is not None:
-			if near_cash["steps"] == 0:
-				c = Move.carpet(near_cash["direction"], near_cash["roll"])
-				if bs.is_valid_move(c):
-					return self._record_action(c)
-			else:
-				d = next_step_toward(bs, start, near_cash["cell"])
-				if d is not None:
-					c = Move.plain(d)
+		pot_cell, pot_steps, pot_score = best_reachable_potential(bs, start)
+
+		if enemy_threat >= 4:
+			contested = best_contested_carpet_option(bs, start, min_points=max(2, self.contest_min_points - 1))
+			if contested is not None:
+				if contested["steps"] == 0:
+					c = Move.carpet(contested["direction"], contested["roll"])
 					if bs.is_valid_move(c):
 						return self._record_action(c)
+				else:
+					d = next_step_toward(bs, start, contested["cell"])
+					if d is not None:
+						c = Move.plain(d)
+						if bs.is_valid_move(c):
+							return self._record_action(c)
 
-		# 4) Contested conversion denial before search.
-		enemy_threat = immediate_carpet_value_enemy(bs)
+		# 4) Fast carpet rush (1-3 steps), biased to long lines.
+		if turns_left <= 24 or score_gap < 0 or enemy_threat >= 3:
+			rush_steps = RUSH_CARPET_MAX_STEPS if time_left_seconds > LOW_TIME_SHALLOW_SECONDS else 2
+			rush_min_points = RUSH_CARPET_MIN_POINTS if turns_left >= 12 else 3
+			if pot_score >= 8.0 and pot_steps <= 2:
+				rush_min_points = min(rush_min_points, 3)
+			if enemy_threat >= 4:
+				rush_steps = max(2, rush_steps - 1)
+			if score_gap < 0:
+				rush_min_points = max(3, rush_min_points - 1)
+			if score_gap <= -6 or enemy_threat >= 5:
+				rush_min_points = 2
+			near_cash = best_nearby_carpet_option(bs, start, turns_left, max_steps=rush_steps, min_points=rush_min_points)
+			if near_cash is not None:
+				if near_cash["steps"] == 0:
+					c = Move.carpet(near_cash["direction"], near_cash["roll"])
+					if bs.is_valid_move(c):
+						return self._record_action(c)
+				else:
+					d = next_step_toward(bs, start, near_cash["cell"])
+					if d is not None:
+						c = Move.plain(d)
+						if bs.is_valid_move(c):
+							return self._record_action(c)
+
+		# 5) Contested conversion denial before search.
 		if (
 			enemy_threat >= 3
 			or score_gap <= -4
@@ -849,7 +1169,7 @@ class PlayerAgent:
 						if bs.is_valid_move(c):
 							return self._record_action(c)
 
-		# 5) Endgame route to guaranteed carpets.
+		# 6) Endgame route to guaranteed carpets.
 		if turns_left <= self.endgame_convert_turns:
 			cash = best_reachable_carpet_option(bs, start, turns_left)
 			if cash is not None:
@@ -864,28 +1184,32 @@ class PlayerAgent:
 						if bs.is_valid_move(c):
 							return self._record_action(c)
 
-		# 6) Alpha-beta tactical move.
+		# 7) Controlled belief-guided search only when it is likely to pay off.
+		if self.search_cd == 0 and time_left_seconds > 18.0 and enemy_threat <= 1 and turns_left > 14 and short_cash is None:
+			best_i = int(np.argmax(belief))
+			best_p = float(belief[best_i])
+			sorted_belief = np.sort(belief)
+			second_p = float(sorted_belief[-2]) if sorted_belief.size > 1 else 0.0
+			if best_p >= 0.48 and (best_p - second_p) >= 0.14 and mobility_now >= 3:
+				self.search_cd = 3
+				return self._record_action(Move.search(loc_i(best_i)))
+
+		# 8) Alpha-beta tactical move.
 		move = self._best_move_ab(bs, belief, time_left_seconds, score_gap)
 		if move is not None and bs.is_valid_move(move):
 			return self._record_action(move)
 
-		# 7) Controlled search usage only when safe.
-		if self.search_cd == 0 and time_left_seconds > 10.0 and enemy_threat <= 1 and turns_left > 12:
-			best_i = int(np.argmax(belief))
-			best_p = float(belief[best_i])
-			if best_p > 0.30:
-				self.search_cd = 3
-				return self._record_action(Move.search(loc_i(best_i)))
-
-		# 8) Fallback.
+		# 9) Fallback.
 		moves = bs.get_valid_moves(exclude_search=True)
 		if moves:
+			best_fallback = max(
+				moves,
+				key=lambda mv: (immediate_point_delta(bs, mv), move_heuristic(bs, mv, belief, self.q_type)),
+			)
+			if bs.is_valid_move(best_fallback):
+				return self._record_action(best_fallback)
 			for m in moves:
-				if m.move_type == MoveType.CARPET and bs.is_valid_move(m):
+				if bs.is_valid_move(m):
 					return self._record_action(m)
-			for m in moves:
-				if m.move_type == MoveType.PLAIN and bs.is_valid_move(m):
-					return self._record_action(m)
-			return self._record_action(moves[0])
 
 		return self._record_action(Move.search((0, 0)))
