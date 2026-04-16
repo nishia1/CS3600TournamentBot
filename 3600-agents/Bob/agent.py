@@ -67,8 +67,24 @@ class PlayerAgent:
     your program and should not be changed.
     """
     def evaluate(self, board):
-        # to evaluate, decide different between you and the opponent
-        return board.player_worker.get_points() - board.opponent_worker.get_points()
+        score = board.player_worker.get_points() - board.opponent_worker.get_points()
+
+        px, py = board.player_worker.get_location()
+
+        primed = 0
+        for x in range(BOARD_SIZE):
+            for y in range(BOARD_SIZE):
+                if board.get_cell((x, y)) == Cell.PRIMED:
+                    primed += 1
+                    dist = abs(px - x) + abs(py - y)
+                    score += 0.3 * max(0, 5 - dist)
+
+        myMoves = len(board.get_valid_moves())
+        reverseBoard = board.get_copy()
+        reverseBoard.reverse_perspective()
+        oppMoves = len(reverseBoard.get_valid_moves())
+
+        return score + 0.5 * (myMoves - oppMoves)
 
     
     def heuristic(self, board, move):
@@ -78,37 +94,51 @@ class PlayerAgent:
         # 2. carpet potential close to you, bring them together to allow to stealing from opponent
         # 3. mobility - more options u have, if opponent has more options than u. thats bad. 
         # can det how many valid moves left for u after this vs how many valid moves left for the opponent (reverse board, and get len of their valid moves)
-        scoreDiff = board.player_worker.get_points() - board.opponent_worker.get_points()
-        carpetPotential = 0
-        px, py = board.player_worker.get_location()
-        ox, oy = board.opponent_worker.get_location()
+        score = 0
+        # --- simulate move ---
+        newBoard = board.forecast_move(move)
+        if newBoard is None:
+            return -float('inf')
+        # --- 1. ACTUAL SCORE CHANGE (MOST IMPORTANT) ---
+        scoreDiff = newBoard.player_worker.get_points() - board.player_worker.get_points()
+        # encourage change in score or board
+        if scoreDiff == 0:
+            score -= 15 # discourage doing nothing
+        score += 5 * scoreDiff   # heavily reward real points
+        # --- 2. MOVE TYPE PRIORITY ---
+        if move.move_type == MoveType.PLAIN:
+            score -= 5   # discourage useless walking
+        elif move.move_type == MoveType.PRIME:
+            score += 10   # priming is always good earl
+        elif move.move_type == MoveType.CARPET:
+            score += 20   # carpets are huge
+        elif move.move_type == MoveType.SEARCH:
+            score += 1   # small bias
+        # --- 3. MOBILITY ---
+        myMoves = len(newBoard.get_valid_moves())
+        reverseBoard = newBoard.get_copy()
+        reverseBoard.reverse_perspective()
+        oppMoves = len(reverseBoard.get_valid_moves())
+        score += 0.1 * (myMoves - oppMoves)
+        # --- 4. LIGHT POSITIONAL PRESSURE ---
+        px, py = newBoard.player_worker.get_location()
+        ox, oy = newBoard.opponent_worker.get_location()
+        dist = abs(px - ox) + abs(py - oy)
+        score += -0.1 * dist  # slightly prefer being closer
+        # reward potential for carpeting
+        # reward being near primed tiles (setup for carpets)
         for x in range(BOARD_SIZE):
             for y in range(BOARD_SIZE):
-                cell = board.get_cell((x, y))
-                if cell == Cell.CARPET:
-                    distToMe = abs(x - px) + abs(y - py)
-                    distToOpponent = abs(x - ox) + abs(y - oy)
-                    if distToMe < distToOpponent:
-                        carpetPotential += 1
-                    elif distToOpponent < distToMe:
-                        carpetPotential -= 1
-        mobility = len(board.get_valid_moves())
-        reverseBoard = board.get_copy()
-        reverseBoard.reverse_perspective()
-        opponentMobility = len(reverseBoard.get_valid_moves())
-        mobilityScore = mobility - opponentMobility
-        forwardBias = 0
-        if move.move_type in (MoveType.PLAIN, MoveType.PRIME, MoveType.CARPET):
-            next_loc = board.player_worker.get_location()
-            if move.direction == 0:
-                forwardBias = -1 if py > oy else 1
-            elif move.direction == 1:
-                forwardBias = 1 if px < ox else -1
-            elif move.direction == 2:
-                forwardBias = 1 if py < oy else -1
-            elif move.direction == 3:
-                forwardBias = -1 if px > ox else 1
-        return scoreDiff + carpetPotential + mobilityScore + 0.35 * forwardBias
+                if newBoard.get_cell((x, y)) == Cell.PRIMED:
+                    dist = abs(px - x) + abs(py - y)
+                    score += 0.05 * (5 - dist)
+        # discourage staying in the same place
+        # discourage staying in same place / useless moves
+        old_pos = board.player_worker.get_location()
+        new_pos = newBoard.player_worker.get_location()
+        if new_pos == old_pos:
+            score -= 20
+        return score
 
     def negamax(self, board, depth, alpha, beta, color):
         if depth == 0 or board.is_game_over() or (board.player_worker.turns_left <= 0 and board.opponent_worker.turns_left <= 0):
@@ -171,16 +201,25 @@ class PlayerAgent:
         """
         #moves = board.get_valid_moves()
         #return random.choice(moves)
+        moves = board.get_valid_moves()
+
+        # FORCE priming if available (this breaks the loop behavior)
+        prime_moves = [m for m in moves if m.move_type == MoveType.PRIME]
         self.rat_hmm.update(sensor_data, board)
         likely_pos = self.rat_hmm.likelycell()
         # run negamax to find best move, using wikipedia implementation
+        prob = float(jnp.max(self.rat_hmm.val))
+        likely_pos = self.rat_hmm.likelycell()
+        # only guess if confident
+        if prob > 0.8:
+            return Move.search(likely_pos)
         best_move = None
         best_value = -float('inf')
         for move in board.get_valid_moves():
             newBoard = board.forecast_move(move)
             if newBoard is None:
                 continue
-            value, move = self.negamax(newBoard, 3, -float('inf'), float('inf'), -1)
+            value, _ = self.negamax(newBoard, 4, -float('inf'), float('inf'), -1)
             value = -value
             if value > best_value:
                 best_value = value
@@ -191,6 +230,8 @@ class PlayerAgent:
         # if rat_score > best_value:
         #     # we should guess the position of the rat
         #     best_move = Move.search(rat_pos)
-        if best_move is None:
-            return random.choice(board.get_valid_moves())
-            
+        if prime_moves:
+            # only force if negamax gives garbage
+            if best_move is None or best_value < 1:
+                return random.choice(prime_moves)
+        return best_move
