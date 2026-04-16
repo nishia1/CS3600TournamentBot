@@ -17,8 +17,7 @@ class RatHMM:
         self.n = BOARD_SIZE * BOARD_SIZE  # 64
         self.val = jnp.zeros(self.n)
         self.val = self.val.at[0].set(1.0)
-        for _ in range(1000):
-            self.val = self.val @ self.T
+        self.val = jnp.linalg.matrix_power(self.T, 1000)[0]
         # precomp all possible x y positions
         xs = jnp.arange(BOARD_SIZE)
         ys = jnp.arange(BOARD_SIZE)
@@ -112,21 +111,26 @@ class PlayerAgent:
         return scoreDiff + carpetPotential + mobilityScore + 0.35 * forwardBias
 
     def negamax(self, board, depth, alpha, beta, color):
-        if depth == 0 or board.is_game_over():
-            return color * self.evaluate(board)
-
+        if depth == 0 or board.is_game_over() or (board.player_worker.turns_left <= 0 and board.opponent_worker.turns_left <= 0):
+            return (color * self.evaluate(board), None)
         childNodes = board.get_valid_moves()
         childNodes = sorted(childNodes, key=lambda move: self.heuristic(board, move), reverse=True)
         value = -float('inf')
+        bestMove = None
         for move in childNodes:
             newBoard = board.forecast_move(move)
             if newBoard is None:
                 continue
-            value = max(value, -self.negamax(newBoard, depth - 1, -beta, -alpha, -color))
+            val, _ = self.negamax(newBoard, depth - 1, -beta, -alpha, -color)
+            val = -val
+            if (val > value):
+                bestMove = move
+                value = val
+            # value = max(value, -self.negamax(newBoard, depth - 1, -beta, -alpha, -color))
             alpha = max(alpha, value)
             if alpha >= beta:
                 break
-        return value
+        return (value, bestMove)
     
     def search(self, board, depth):
         if (depth == 0):
@@ -174,15 +178,19 @@ class PlayerAgent:
         best_value = -float('inf')
         for move in board.get_valid_moves():
             newBoard = board.forecast_move(move)
-            value = -self.negamax(newBoard, 6, -float('inf'), float('inf'), -1)
+            if newBoard is None:
+                continue
+            value, move = self.negamax(newBoard, 3, -float('inf'), float('inf'), -1)
+            value = -value
             if value > best_value:
                 best_value = value
                 best_move = move
-        # check if rat has better value instead
-        rat_pos = self.rat_hmm.likelycell()
-        rat_score = float(jnp.max(self.rat_hmm.val)) * 100.0
-        if rat_score > best_value:
-            # we should guess the position of the rat
-            best_move = Move.search(rat_pos)
-        return best_move
+        # # check if rat has better value instead
+        # rat_pos = self.rat_hmm.likelycell()
+        # rat_score = float(jnp.max(self.rat_hmm.val)) * 4
+        # if rat_score > best_value:
+        #     # we should guess the position of the rat
+        #     best_move = Move.search(rat_pos)
+        if best_move is None:
+            return random.choice(board.get_valid_moves())
             
