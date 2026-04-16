@@ -65,6 +65,38 @@ class PlayerAgent:
     /you may add and modify functions, however, __init__, commentate and play are the entry points for
     your program and should not be changed.
     """
+    def evaluate(self, board):
+        # to evaluate, decide different between you and the opponent
+
+    
+    def heuristic(self, move):
+        # want to decide if a move is good or not
+        # need to keep a few things in mind
+        # 1. difference between my score and the opponents score
+        # 2. carpet potential close to you, bring them together to allow to stealing from opponent
+        # 3. mobility - more options u have, if opponent has more options than u. thats bad. 
+        # can det how many valid moves left for u after this vs how many valid moves left for the opponent (reverse board, and get len of their valid moves)
+        scoreDiff = # idk how to do this part
+        carpetPotential = # also not sure how to do this part, maybe look at the 4 adjacent cells and see if they are carpets, if they are then add to the potential score
+        mobility = len(board.get_valid_moves())
+        reverseBoard = board.reverse_perspective()
+        opponentMobility = len(reverseBoard.get_valid_moves())
+        mobilityScore = mobility - opponentMobility
+        return scoreDiff + carpetPotential + mobilityScore
+
+    def negamax(board, depth, alpha, beta, color):
+        if (depth == 0 or board.is_game_over()):
+            return color * self.evaluate(board)
+        childNodes = board.get_valid_moves()
+        childNodes = sorted(childNodes, key=lambda move: self.heuristic(move), reverse=True)
+        value = -float('inf')
+        for move in childNodes:
+            newBoard = board.forecast_move(move)
+            value = max(value, -negamax(newBoard, depth-1, -beta, -alpha, -color))
+            alpha = max(alpha, value)
+            if alpha >= beta:
+                break
+    
     def search(self, board, depth):
         if (depth == 0):
             return self.evalute(board);
@@ -72,7 +104,7 @@ class PlayerAgent:
             moves = board.get_valid_moves()
             for move in moves:
                 newBoard =  board.forecast_move(move)
-                search(self, newBoard, depth-1)
+                negamax(newBoard, depth-1, -float('inf'), float('inf'), -1)
 
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -89,7 +121,7 @@ class PlayerAgent:
         """
         Optional: You can use this function to print out any commentary you want at the end of the game.
         """
-        return "trying really hard to not go clinically insane"
+        return "hi trying really hard to not go clinically insane"
 
     def play(
         self,
@@ -102,5 +134,22 @@ class PlayerAgent:
         You may do so however you like, including adding extra functions,
         variables. Return a valid move from this function.
         """
-        moves = board.get_valid_moves()
-        return random.choice(moves)
+        #moves = board.get_valid_moves()
+        #return random.choice(moves)
+        self.rat_hmm.update(sensor_data, board)
+        likely_pos = self.rat_hmm.likelycell()
+        # run negamax to find best move
+        best_move = None
+        best_value = -float('inf')
+        for move in board.get_valid_moves():
+            newBoard = board.forecast_move(move)
+            value = -self.negamax(newBoard, 3, -float('inf'), float('inf'), -1)
+            if value > best_value:
+                best_value = value
+                best_move = move
+        # check if rat has better value instead
+        if likely_pos > best_value:
+            # we should guess the position of the rat
+            best_move = move.Move.guess(likely_pos)
+        return best_move
+            
