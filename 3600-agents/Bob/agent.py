@@ -3,8 +3,10 @@ from typing import List, Set, Tuple
 import random
 import jax.numpy as jnp
 
-from game.enums import Cell, BOARD_SIZE
-from game import board, move, enums
+from game.board import Board
+from game.enums import Cell, BOARD_SIZE, Noise, MoveType
+from game.move import Move
+from game.rat import NOISE_PROBS, DISTANCE_ERROR_PROBS, DISTANCE_ERROR_OFFSETS, manhattan_distance
 
 # negamax with alpha beta pruning
 # rat hmm function
@@ -67,44 +69,73 @@ class PlayerAgent:
     """
     def evaluate(self, board):
         # to evaluate, decide different between you and the opponent
+        return board.player_worker.get_points() - board.opponent_worker.get_points()
 
     
-    def heuristic(self, move):
+    def heuristic(self, board, move):
         # want to decide if a move is good or not
         # need to keep a few things in mind
         # 1. difference between my score and the opponents score
         # 2. carpet potential close to you, bring them together to allow to stealing from opponent
         # 3. mobility - more options u have, if opponent has more options than u. thats bad. 
         # can det how many valid moves left for u after this vs how many valid moves left for the opponent (reverse board, and get len of their valid moves)
-        scoreDiff = # idk how to do this part
-        carpetPotential = # also not sure how to do this part, maybe look at the 4 adjacent cells and see if they are carpets, if they are then add to the potential score
+        scoreDiff = board.player_worker.get_points() - board.opponent_worker.get_points()
+        carpetPotential = 0
+        px, py = board.player_worker.get_location()
+        ox, oy = board.opponent_worker.get_location()
+        for x in range(BOARD_SIZE):
+            for y in range(BOARD_SIZE):
+                cell = board.get_cell((x, y))
+                if cell == Cell.CARPET:
+                    distToMe = abs(x - px) + abs(y - py)
+                    distToOpponent = abs(x - ox) + abs(y - oy)
+                    if distToMe < distToOpponent:
+                        carpetPotential += 1
+                    elif distToOpponent < distToMe:
+                        carpetPotential -= 1
         mobility = len(board.get_valid_moves())
-        reverseBoard = board.reverse_perspective()
+        reverseBoard = board.get_copy()
+        reverseBoard.reverse_perspective()
         opponentMobility = len(reverseBoard.get_valid_moves())
         mobilityScore = mobility - opponentMobility
-        return scoreDiff + carpetPotential + mobilityScore
+        forwardBias = 0
+        if move.move_type in (MoveType.PLAIN, MoveType.PRIME, MoveType.CARPET):
+            next_loc = board.player_worker.get_location()
+            if move.direction == 0:
+                forwardBias = -1 if py > oy else 1
+            elif move.direction == 1:
+                forwardBias = 1 if px < ox else -1
+            elif move.direction == 2:
+                forwardBias = 1 if py < oy else -1
+            elif move.direction == 3:
+                forwardBias = -1 if px > ox else 1
+        return scoreDiff + carpetPotential + mobilityScore + 0.35 * forwardBias
 
-    def negamax(board, depth, alpha, beta, color):
-        if (depth == 0 or board.is_game_over()):
+    def negamax(self, board, depth, alpha, beta, color):
+        if depth == 0 or board.is_game_over():
             return color * self.evaluate(board)
+
         childNodes = board.get_valid_moves()
-        childNodes = sorted(childNodes, key=lambda move: self.heuristic(move), reverse=True)
+        childNodes = sorted(childNodes, key=lambda move: self.heuristic(board, move), reverse=True)
         value = -float('inf')
         for move in childNodes:
             newBoard = board.forecast_move(move)
-            value = max(value, -negamax(newBoard, depth-1, -beta, -alpha, -color))
+            if newBoard is None:
+                continue
+            value = max(value, -self.negamax(newBoard, depth - 1, -beta, -alpha, -color))
             alpha = max(alpha, value)
             if alpha >= beta:
                 break
+        return value
     
     def search(self, board, depth):
         if (depth == 0):
-            return self.evalute(board);
+            return self.evaluate(board)
         else:
             moves = board.get_valid_moves()
             for move in moves:
                 newBoard =  board.forecast_move(move)
-                negamax(newBoard, depth-1, -float('inf'), float('inf'), -1)
+                self.negamax(newBoard, depth - 1, -float('inf'), float('inf'), -1)
 
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -125,7 +156,7 @@ class PlayerAgent:
 
     def play(
         self,
-        board: board.Board,
+        board: Board,
         sensor_data: Tuple,
         time_left: Callable,
     ):
@@ -138,7 +169,7 @@ class PlayerAgent:
         #return random.choice(moves)
         self.rat_hmm.update(sensor_data, board)
         likely_pos = self.rat_hmm.likelycell()
-        # run negamax to find best move
+        # run negamax to find best move, using wikipedia implementation
         best_move = None
         best_value = -float('inf')
         for move in board.get_valid_moves():
@@ -148,8 +179,10 @@ class PlayerAgent:
                 best_value = value
                 best_move = move
         # check if rat has better value instead
-        if likely_pos > best_value:
+        rat_pos = self.rat_hmm.likelycell()
+        rat_score = float(jnp.max(self.rat_hmm.val)) * 100.0
+        if rat_score > best_value:
             # we should guess the position of the rat
-            best_move = move.Move.guess(likely_pos)
+            best_move = Move.search(rat_pos)
         return best_move
             
