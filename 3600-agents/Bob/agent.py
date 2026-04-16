@@ -9,6 +9,17 @@ class RatHMM:
     def update(self, sensor_data):
         # update probabilities of the val
         # for each cell in board, update probability by doing rat
+        # 1. predict
+        self.val = self.val @ self.transition_matrix
+
+        # 2. update (if you have observation)
+        self.val *= sensor_data
+        self.val /= self.val.sum()
+    
+    # call this to det which cell most likely to have rat and expected value of move
+    # which is just 4 times the cell with the highest probablity of having the rat
+    def likelycell(self):
+        return jnp.unravel_index(jnp.argmax(self.val), self.val.shape) * 4
 
     def __init__(self, board, transition_matrix=None):
         # make a jax array of all equal probabilities for each cell in the board inititally
