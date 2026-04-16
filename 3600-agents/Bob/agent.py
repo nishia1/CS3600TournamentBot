@@ -6,6 +6,9 @@ import jax.numpy as jnp
 from game.enums import Cell, BOARD_SIZE
 from game import board, move, enums
 
+# negamax with alpha beta pruning
+# rat hmm function
+
 class RatHMM:
     def __init__(self, board, transition_matrix):
         self.T = jnp.array(transition_matrix)
@@ -62,6 +65,15 @@ class PlayerAgent:
     /you may add and modify functions, however, __init__, commentate and play are the entry points for
     your program and should not be changed.
     """
+    def search(self, board, depth):
+        if (depth == 0):
+            return self.evalute(board);
+        else:
+            moves = board.get_valid_moves()
+            for move in moves:
+                newBoard =  board.forecast_move(move)
+                search(self, newBoard, depth-1)
+
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
 
@@ -71,13 +83,13 @@ class PlayerAgent:
         """
         # call rat init code
         self.rat_hmm = RatHMM(board, transition_matrix)
-        pass
+        #pass
         
     def commentate(self):
         """
         Optional: You can use this function to print out any commentary you want at the end of the game.
         """
-        return "nishi is trying really hard to not go clinically insane"
+        return "trying really hard to not go clinically insane"
 
     def play(
         self,
