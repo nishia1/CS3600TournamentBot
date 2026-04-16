@@ -174,7 +174,7 @@ class PlayerAgent:
         best_value = -float('inf')
         for move in board.get_valid_moves():
             newBoard = board.forecast_move(move)
-            value = -self.negamax(newBoard, 3, -float('inf'), float('inf'), -1)
+            value = -self.negamax(newBoard, 6, -float('inf'), float('inf'), -1)
             if value > best_value:
                 best_value = value
                 best_move = move
