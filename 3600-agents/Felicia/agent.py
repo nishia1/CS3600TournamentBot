@@ -13,52 +13,68 @@ from game.rat import NOISE_PROBS, DISTANCE_ERROR_PROBS, DISTANCE_ERROR_OFFSETS, 
 CARPET_POINTS = {1: -1, 2: 2, 3: 4, 4: 6, 5: 10, 6: 15, 7: 21}
 
 class RatHMM:
+    
     def __init__(self, board, transition_matrix):
         self.T = jnp.array(transition_matrix)
         self.n = BOARD_SIZE * BOARD_SIZE
-        self.val = jnp.zeros(self.n)
-        self.val = self.val.at[0].set(1.0)
-        self.val = jnp.linalg.matrix_power(self.T, 1000)[0]
+
+        # Precompute stationary distribution ONCE
+        self.stationary = jnp.linalg.matrix_power(self.T, 50)[0]
+
         xs = jnp.arange(BOARD_SIZE)
         ys = jnp.arange(BOARD_SIZE)
         grid_x, grid_y = jnp.meshgrid(xs, ys)
         self.positions = jnp.stack([grid_x.flatten(), grid_y.flatten()], axis=1)
-        self.cell_types = jnp.array(
-            [board.get_cell((int(x), int(y))).value for x, y in self.positions]
-        )
-        self.noise_prob_table = jnp.array([NOISE_PROBS[Cell(i)] for i in range(len(NOISE_PROBS))])
-        self.dist_probs = jnp.array(DISTANCE_ERROR_PROBS)
-        self.dist_offsets = jnp.array(DISTANCE_ERROR_OFFSETS)
+
+        self.noise_prob_table = jnp.array([
+            NOISE_PROBS[Cell(i)] for i in range(len(NOISE_PROBS))
+        ])
+
+        self.posterior = self.stationary.copy()
 
     def update(self, sensor_data, board):
         noise, observed_dist = sensor_data
-        self.val = self.val @ self.T
-        self.cell_types = jnp.array([board.get_cell((int(x), int(y))).value for x, y in self.positions])
-        likelihood = self.compute_likelihood(noise, observed_dist, board)
-        self.val = self.val * likelihood
-        total = self.val.sum()
-        self.val = jnp.where(total > 0, self.val / total, jnp.ones_like(self.val) / self.n)
 
-    def compute_likelihood(self, noise, observed_dist, board):
-        noise_probs = self.noise_prob_table[self.cell_types, noise.value]
+        # --- PRIOR (stationary every turn) ---
+        prior = self.stationary
+
+        # --- NOISE LIKELIHOOD ---
+        cell_types = jnp.array([
+            board.get_cell((int(x), int(y))).value
+            for x, y in self.positions
+        ])
+        noise_probs = self.noise_prob_table[cell_types, noise.value]
+
+        # --- DISTANCE LIKELIHOOD ---
         wx, wy = board.player_worker.get_location()
         worker_pos = jnp.array([wx, wy])
-        dists = jnp.abs(self.positions - worker_pos).sum(axis=1)
-        possible_obs = dists[:, None] + self.dist_offsets
-        possible_obs = jnp.maximum(possible_obs, 0)
-        matches = (possible_obs == observed_dist)
-        dist_probs = (matches * self.dist_probs).sum(axis=1)
-        return noise_probs * dist_probs
+
+        true_dists = jnp.abs(self.positions - worker_pos).sum(axis=1)
+        delta = observed_dist - true_dists
+
+        dist_probs = jnp.where(delta == -1, 0.12,
+                    jnp.where(delta == 0, 0.7,
+                    jnp.where(delta == 1, 0.12,
+                    jnp.where(delta == 2, 0.06, 0.0))))
+
+        # --- COMBINE ---
+        likelihood = noise_probs * dist_probs
+        posterior = prior * likelihood
+
+        total = posterior.sum()
+        self.posterior = jnp.where(
+            total > 0,
+            posterior / total,
+            jnp.ones_like(posterior) / self.n
+        )
 
     def best_guess(self):
-        idx = int(jnp.argmax(self.val))
-        return (idx % BOARD_SIZE, idx // BOARD_SIZE), float(self.val[idx])
+        idx = int(jnp.argmax(self.posterior))
+        x, y = self.positions[idx]
+        return (int(x), int(y)), float(self.posterior[idx])
 
-    def expected_value_of_search(self, pos):
-        x, y = pos
-        idx = y * BOARD_SIZE + x
-        p = float(self.val[idx])
-        return 6.0 * p - 2.0
+    def confidence(self):
+        return float(jnp.max(self.posterior))
 
 class PlayerAgent:
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
@@ -111,6 +127,7 @@ class PlayerAgent:
     def evaluate(self, board):
         score = board.player_worker.get_points() - board.opponent_worker.get_points()
         mobility = (len(board.get_valid_moves()) - len(board.get_valid_moves(enemy = True))) * 0.5
+        carpet = 0.8 * self.best_carpet_value_from(board, board.player_worker.get_location())
         # px, py = board.player_worker.get_location()
         # ox, oy = board.opponent_worker.get_location()
         # # carpet (reduced dominance)
@@ -136,7 +153,7 @@ class PlayerAgent:
         #     score += 1.2
         # else:
         #     score -= 0.05
-        return score + mobility
+        return score + mobility + carpet
     
     def move_score(self, board, move):
         if move.move_type == MoveType.CARPET:
@@ -229,7 +246,28 @@ class PlayerAgent:
         # if (rat_ev > value) return Move.search(rat_pos)
         # else return move
         # value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
-        return self.negamax(board, 8, -float('inf'), float('inf'), 1)[1]
+        # 1. Update belief FIRST
+        self.rat_hmm.update(sensor_data, board)
+        rat_pos, confidence = self.rat_hmm.best_guess()
+        expectedRat = confidence * 6 - 2
+        # 2. Get best move via negamax
+        value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
+
+        # 3. Estimate opponent reply (correct perspective)
+        oppBoard = board.get_copy()
+        oppBoard.reverse_perspective()
+        opp_val, _ = self.negamax(oppBoard, 1, -float('inf'), float('inf'), 1)
+
+        # 4. Normalize comparison (VERY important)
+        current_score = board.player_worker.get_points() - board.opponent_worker.get_points()
+
+        search_value = current_score + expectedRat - opp_val
+
+        # 5. Compare properly
+        if search_value > value:
+            return Move.search(rat_pos)
+
+        return move
         # for m in moves:
         #     if m.move_type == MoveType.CARPET:
         #         nb = board.forecast_move(m)
