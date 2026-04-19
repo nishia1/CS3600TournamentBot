@@ -1,8 +1,9 @@
 from collections.abc import Callable
-from collections import deque
+from collections import deque, OrderedDict
 from typing import List, Set, Tuple
 import random
 import time
+import numpy as np
 import jax.numpy as jnp
 
 from game.board import Board
@@ -50,8 +51,7 @@ class RatHMM:
                     self.posterior
                 )
             else:
-                # we found it and opponent didnt search so
-                # reinit everyting
+                # we found it and opponent didnt search so reinit everything
                 self.posterior = self.stationary.copy()
         elif myRat is not None and not mySearch:
             # tried to find but failed
@@ -83,9 +83,10 @@ class RatHMM:
                     0.0,
                     self.posterior
                 )
+
         noise, observed_dist = sensor_data
 
-        # --- PRIOR (stationary every turn) ---
+        # --- PROPAGATE FORWARD then use as prior ---
         self.posterior = self.posterior @ self.T
         prior = self.posterior.copy()
 
@@ -127,6 +128,7 @@ class RatHMM:
     def confidence(self):
         return float(jnp.max(self.posterior))
 
+
 class PlayerAgent:
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
         self.rat_hmm = RatHMM(board, transition_matrix)
@@ -137,6 +139,31 @@ class PlayerAgent:
 
         self.turn_count = 0
         self.wrong_guess_cooldown = 0
+
+        # --- Transposition table ---
+        self.transposition_table = OrderedDict()
+        self.TT_SIZE = 1_000_000
+
+        # --- Zobrist hashing ---
+        rng = np.random.default_rng(42)
+        self.zobrist_table = rng.integers(
+            0, 2**63, size=(BOARD_SIZE, BOARD_SIZE, len(Cell)), dtype=np.int64
+        )
+        self.zobrist_players = rng.integers(
+            0, 2**63, size=(BOARD_SIZE * BOARD_SIZE, 2), dtype=np.int64
+        )
+
+    def board_hash(self, board):
+        h = np.int64(0)
+        for x in range(BOARD_SIZE):
+            for y in range(BOARD_SIZE):
+                cell = board.get_cell((x, y))
+                h ^= self.zobrist_table[x, y, cell.value]
+        px, py = board.player_worker.get_location()
+        ox, oy = board.opponent_worker.get_location()
+        h ^= self.zobrist_players[px * BOARD_SIZE + py, 0]
+        h ^= self.zobrist_players[ox * BOARD_SIZE + oy, 1]
+        return int(h)
 
     def longest_primed_run_from(self, board, start, direction):
         dx, dy = direction
@@ -160,55 +187,16 @@ class PlayerAgent:
             best = max(best, CARPET_POINTS.get(run, 21))
         return best
 
-    def primed_cluster_value(self, board, px, py):
-        score = 0.0
-        for x in range(BOARD_SIZE):
-            for y in range(BOARD_SIZE):
-                if board.get_cell((x, y)) == Cell.PRIMED:
-                    dist = abs(px - x) + abs(py - y)
-                    for d in [(1,0),(0,1)]:
-                        f = self.longest_primed_run_from(board, (x,y), d)
-                        b = self.longest_primed_run_from(board, (x,y), (-d[0], -d[1]))
-                        run = 1 + max(f, b)
-                        if run >= 2:
-                            val = CARPET_POINTS.get(min(run, 7), 21)
-                            score += val * 0.15 + max(0, 6 - dist) * 0.2
-        return score
-
     def evaluate(self, board):
         score = board.player_worker.get_points() - board.opponent_worker.get_points()
-        mobility = (len(board.get_valid_moves()) - len(board.get_valid_moves(enemy = True))) * 0.5
+        mobility = (len(board.get_valid_moves()) - len(board.get_valid_moves(enemy=True))) * 0.5
         carpet = 0.8 * self.best_carpet_value_from(board, board.player_worker.get_location())
-        #opp_carpet = 0.8 * self.best_carpet_value_from(board, board.opponent_worker.get_location())
-        # px, py = board.player_worker.get_location()
-        # ox, oy = board.opponent_worker.get_location()
-        # # carpet (reduced dominance)
-        # score += self.primed_cluster_value(board, px, py) * 0.28
-        # # mobility advantage
-        # my_moves = len(board.get_valid_moves())
-        # rev = board.get_copy()
-        # rev.reverse_perspective()
-        # opp_moves = len(rev.get_valid_moves())
-        # score += 0.3 * (my_moves - opp_moves)
-        # # distance pressure
-        # score -= 0.05 * (abs(px - ox) + abs(py - oy))
-        # # soft loop detection (NOT over-penalizing movement)
-        # if len(self.last_positions) >= 4:
-        #     if self.last_positions[-1] == self.last_positions[-3]:
-        #         score -= 0.8
-        # # movement encouragement (fixes freezing)
-        # if len(self.last_positions) >= 2:
-        #     if self.last_positions[-1] != self.last_positions[-2]:
-        #         score += 0.6
-        # # exploration reward (balanced)
-        # if (px, py) not in self.visited:
-        #     score += 1.2
-        # else:
-        #     score -= 0.05
-        #return score + mobility + carpet - opp_carpet
         return score + mobility + carpet
-    
-    def move_score(self, board, move):
+
+    def move_score(self, board, move, tt_move=None):
+        # TT move gets highest priority
+        if tt_move and move == tt_move:
+            return 10000
         if move.move_type == MoveType.CARPET:
             nb = board.forecast_move(move)
             if nb:
@@ -219,37 +207,57 @@ class PlayerAgent:
             nb = board.forecast_move(move)
             if nb:
                 x, y = nb.player_worker.get_location()
-                return 20 + self.best_carpet_value_from(board, (x, y)) * 5
+                return 20 + self.best_carpet_value_from(nb, (x, y)) * 5
         if move.move_type == MoveType.PLAIN:
             nb = board.forecast_move(move)
             if nb:
                 x, y = nb.player_worker.get_location()
-                return 5 + self.best_carpet_value_from(board, (x, y))
+                return 5 + self.best_carpet_value_from(nb, (x, y))
         if move.move_type == MoveType.SEARCH:
             return -10
         return 0
 
     def commentate(self):
-        """
-        Optional: You can use this function to print out any commentary you want at the end of the game.
-        """
         return "ragebait"
 
-    def negamax(self, board, depth, alpha, beta, color):
+    def negamax(self, board, depth, alpha, beta):
+        # --- Transposition table lookup ---
+        h = self.board_hash(board)
+        tt_move = None
+        if h in self.transposition_table:
+            entry = self.transposition_table[h]
+            tt_move = entry.get('move')
+            if entry['depth'] >= depth:
+                flag = entry['flag']
+                val = entry['val']
+                if flag == 'exact':
+                    return val, tt_move
+                elif flag == 'lower':
+                    alpha = max(alpha, val)
+                elif flag == 'upper':
+                    beta = min(beta, val)
+                if alpha >= beta:
+                    return val, tt_move
+
         if depth == 0 or board.is_game_over():
-            return color * self.evaluate(board), None
+            return self.evaluate(board), None
+
         moves = board.get_valid_moves()
         if not moves:
-            return color * self.evaluate(board), None
-        moves.sort(key=lambda m: self.move_score(board, m), reverse=True)
+            return self.evaluate(board), None
+
+        moves.sort(key=lambda m: self.move_score(board, m, tt_move=tt_move), reverse=True)
+
         best_val = -float('inf')
         best_move = moves[0]
+        original_alpha = alpha
+
         for move in moves:
             nb = board.forecast_move(move)
-            nb.reverse_perspective()
             if not nb:
                 continue
-            val, _ = self.negamax(nb, depth - 1, -beta, -alpha, -color)
+            nb.reverse_perspective()
+            val, _ = self.negamax(nb, depth - 1, -beta, -alpha)
             val = -val
             if val > best_val:
                 best_val = val
@@ -257,85 +265,55 @@ class PlayerAgent:
             alpha = max(alpha, best_val)
             if alpha >= beta:
                 break
+
+        # --- Store in transposition table ---
+        if best_val <= original_alpha:
+            flag = 'upper'
+        elif best_val >= beta:
+            flag = 'lower'
+        else:
+            flag = 'exact'
+
+        if len(self.transposition_table) >= self.TT_SIZE:
+            self.transposition_table.popitem(last=False)  # evict oldest
+        self.transposition_table[h] = {
+            'val': best_val,
+            'move': best_move,
+            'depth': depth,
+            'flag': flag
+        }
+
         return best_val, best_move
 
-    # def iterative_deepening(self, board, time_budget=1.5):
-    #     start = time.time()
-    #     best_move = None
-    #     best_val = -float('inf')
-    #     for depth in range(1, 6):
-    #         if time.time() - start > time_budget * 0.65:
-    #             break
-    #         val, move = self.negamax(board, depth, -float('inf'), float('inf'), 1)
-    #         if move:
-    #             best_move = move
-    #             best_val = val
-    #         if time.time() - start > time_budget * 0.9:
-    #             break
-    #     return best_val, best_move
+    def iterative_deepening(self, board, time_budget):
+        start = time.time()
+        best_move = None
+        best_val = -float('inf')
+        for depth in range(1, 20):
+            if time.time() - start > time_budget * 0.5:
+                break
+            val, move = self.negamax(board, depth, -float('inf'), float('inf'))
+            if move:
+                best_move = move
+                best_val = val
+            if time.time() - start > time_budget * 0.9:
+                break
+        return best_val, best_move
 
     def play(self, board: Board, sensor_data: Tuple, time_left: Callable):
-        # self.turn_count += 1
-        # self.rat_hmm.update(sensor_data, board)
-        # rat_pos, _ = self.rat_hmm.best_guess()
-        # rat_ev = self.rat_hmm.expected_value_of_search(rat_pos)
-        # pos = board.player_worker.get_location()
-        # self.last_positions.append(pos)
-        # self.visited.add(pos)
-        # # direction tracking
-        # if len(self.last_positions) >= 2:
-        #     a, b = self.last_positions[-2], self.last_positions[-1]
-        #     self.last_move_dir = (b[0] - a[0], b[1] - a[1])
-        # moves = board.get_valid_moves()
-        # # best immediate carpet
-        # best_carpet = None
-        # best_gain = 0
-        # for m in moves:
-        # additions
-        # self.rat_hmm.update(sensor_data, board)
-        # rat_pos, _ = self.rat_hmm.best_guess()
-        # rat_ev = self.rat_hmm.expected_value_of_search(rat_pos)
-        # val = rat_ev 
-        # if (rat_ev > value) return Move.search(rat_pos)
-        # else return move
-        # value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
-        # 1. Update belief FIRST
+        # 1. Update HMM belief
         self.rat_hmm.update(sensor_data, board)
         rat_pos, confidence = self.rat_hmm.best_guess()
         expectedRat = 6 * confidence - 2
 
-        search_move = Move.search(rat_pos)
-        search_board = board.forecast_move(search_move)
-        search_board.reverse_perspective()
-        opp_val, _ = self.negamax(search_board, 3, -float('inf'), float('inf'), 1)
-        opp_val -= board.player_worker.get_points()
-        opp_val += board.opponent_worker.get_points()
-        if expectedRat > opp_val:
-            return Move.search(rat_pos)
+        # 2. Consider searching — only if confidence is high enough to be worth it
+        if confidence > 0.6:
+            search_move = Move.search(rat_pos)
+            search_board = board.forecast_move(search_move)
+            #search_board.reverse_perspective()
+            opp_val, _ = self.negamax(search_board, 3, -float('inf'), float('inf'))
+            if expectedRat > opp_val:
+                return Move.search(rat_pos)
 
-        value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
+        _, move = self.negamax(board, 8, -float('inf'), float('inf'))
         return move
-        # for m in moves:
-        #     if m.move_type == MoveType.CARPET:
-        #         nb = board.forecast_move(m)
-        #         if nb:
-        #             gain = nb.player_worker.get_points() - board.player_worker.get_points()
-        #             if gain > best_gain:
-        #                 best_gain = gain
-        #                 best_carpet = m
-        # if best_carpet and best_gain >= 4:
-        #     return best_carpet
-        # # if rat_ev > 0 and self.wrong_guess_cooldown == 0 and rat_ev > best_gain:
-        # #     return Move.search(rat_pos)
-        # best_val, best_move = self.iterative_deepening(board)
-        # if not best_move:
-        #     non_search = [m for m in moves if m.move_type != MoveType.SEARCH]
-        #     if non_search:
-        #         return max(non_search, key=lambda m: self.move_score(board, m))
-        #     # return Move.search(rat_pos)
-        # # prevent useless plain-stall
-        # if best_move.move_type == MoveType.PLAIN:
-        #     primes = [m for m in moves if m.move_type == MoveType.PRIME]
-        #     if primes:
-        #         best_move = max(primes, key=lambda m: self.move_score(board, m))
-        # return best_move

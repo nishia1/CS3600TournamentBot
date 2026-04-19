@@ -33,61 +33,10 @@ class RatHMM:
         self.posterior = self.stationary.copy()
 
     def update(self, sensor_data, board):
-        oppRat, oppSearched = board.opponent_search
-        myRat, mySearch = board.player_search
-        if myRat is not None and mySearch:
-            # we found the rat, so now there is a new rat searching around
-            # check if opp found it or guessed for it
-            if oppRat is not None and oppSearched:
-                # opponent also found it, so we reset to stationary (new rat)
-                self.posterior = self.stationary.copy()
-            elif oppRat is not None and not oppSearched:
-                # opponent did not find it, so we can be certain the new rat is not where they searched
-                idx = int(oppRat[0] * 8 + oppRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-            else:
-                # we found it and opponent didnt search so
-                # reinit everyting
-                self.posterior = self.stationary.copy()
-        elif myRat is not None and not mySearch:
-            # tried to find but failed
-            # check if opp found it
-            if oppRat is not None and oppSearched:
-                # opponent found it, so we need to reset
-                self.posterior = self.stationary.copy()
-            elif oppRat is not None and not oppSearched:
-                # opponent also tried but failed, so we can be certain the rat is not where they searched
-                idx = int(oppRat[0] * 8 + oppRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-                # also wasn't where i searched
-                idx = int(myRat[0] * 8 + myRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-            else:
-                # we failed and opponent didnt search
-                # but def not where i searched
-                idx = int(myRat[0] * 8 + myRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
         noise, observed_dist = sensor_data
 
         # --- PRIOR (stationary every turn) ---
-        self.posterior = self.posterior @ self.T
-        prior = self.posterior.copy()
+        prior = self.stationary
 
         # --- NOISE LIKELIHOOD ---
         cell_types = jnp.array([
@@ -179,7 +128,6 @@ class PlayerAgent:
         score = board.player_worker.get_points() - board.opponent_worker.get_points()
         mobility = (len(board.get_valid_moves()) - len(board.get_valid_moves(enemy = True))) * 0.5
         carpet = 0.8 * self.best_carpet_value_from(board, board.player_worker.get_location())
-        #opp_carpet = 0.8 * self.best_carpet_value_from(board, board.opponent_worker.get_location())
         # px, py = board.player_worker.get_location()
         # ox, oy = board.opponent_worker.get_location()
         # # carpet (reduced dominance)
@@ -205,7 +153,6 @@ class PlayerAgent:
         #     score += 1.2
         # else:
         #     score -= 0.05
-        #return score + mobility + carpet - opp_carpet
         return score + mobility + carpet
     
     def move_score(self, board, move):
@@ -302,18 +249,24 @@ class PlayerAgent:
         # 1. Update belief FIRST
         self.rat_hmm.update(sensor_data, board)
         rat_pos, confidence = self.rat_hmm.best_guess()
-        expectedRat = 6 * confidence - 2
+        expectedRat = confidence * 4
+        # 2. Get best move via negamax
+        value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
 
-        search_move = Move.search(rat_pos)
-        search_board = board.forecast_move(search_move)
-        search_board.reverse_perspective()
-        opp_val, _ = self.negamax(search_board, 3, -float('inf'), float('inf'), 1)
-        opp_val -= board.player_worker.get_points()
-        opp_val += board.opponent_worker.get_points()
-        if expectedRat > opp_val:
+        # 3. Estimate opponent reply (correct perspective)
+        oppBoard = board.get_copy()
+        oppBoard.reverse_perspective()
+        opp_val, _ = self.negamax(oppBoard, 1, -float('inf'), float('inf'), 1)
+
+        # 4. Normalize comparison (VERY important)
+        current_score = board.player_worker.get_points() - board.opponent_worker.get_points()
+
+        search_value = current_score + expectedRat - opp_val
+
+        # 5. Compare properly
+        if search_value > value:
             return Move.search(rat_pos)
 
-        value, move = self.negamax(board, 8, -float('inf'), float('inf'), 1)
         return move
         # for m in moves:
         #     if m.move_type == MoveType.CARPET:
