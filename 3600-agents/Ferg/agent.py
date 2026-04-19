@@ -11,11 +11,15 @@ from game.enums import Cell, BOARD_SIZE, Noise, MoveType
 from game.move import Move
 from game.rat import NOISE_PROBS, DISTANCE_ERROR_PROBS, DISTANCE_ERROR_OFFSETS, manhattan_distance
 
+from carlo_class import carlo_node, carlo_tree
+
 CARPET_POINTS = {1: -1, 2: 2, 3: 4, 4: 6, 5: 10, 6: 15, 7: 21}
 
 class RatHMM:
     
     def __init__(self, board, transition_matrix):
+
+
         self.T = jnp.array(transition_matrix)
         self.n = BOARD_SIZE * BOARD_SIZE
 
@@ -131,6 +135,14 @@ class RatHMM:
 
 class PlayerAgent:
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
+
+        # decides when montecarlo search will engage
+        self.carlo_engage = int(0.25 * (BOARD_SIZE * BOARD_SIZE))
+        self.carlo_time = 6
+
+        # monte carlo tree
+        self.this_tree = carlo_tree([board], not board.is_player_a_turn, exploration_constant = 2)
+
         self.rat_hmm = RatHMM(board, transition_matrix)
 
         self.last_positions = deque(maxlen=6)
@@ -303,6 +315,8 @@ class PlayerAgent:
         return best_val, best_move
 
     def play(self, board: Board, sensor_data: Tuple, time_left: Callable):
+
+
         # 1. Update HMM belief
         self.rat_hmm.update(sensor_data, board)
         rat_pos, confidence = self.rat_hmm.best_guess()
@@ -318,8 +332,21 @@ class PlayerAgent:
                 return Move.search(rat_pos)
 
         # 3. Scale depth based on remaining time
-        remaining = time_left()
-        depth = 10 if remaining > 120 else 8
 
-        _, move = self.negamax(board, depth, -float('inf'), float('inf'))
-        return move
+        uncarpeted_count = 0
+        for i in range(BOARD_SIZE):
+            for j in range(BOARD_SIZE):
+                if board.is_cell_carpetable((i, j)):
+                    uncarpeted_count += 1
+        if(uncarpeted_count <= self.carlo_engage):
+            start = time.perf_counter()
+            while (time.perf_counter() - start) <= self.carlo_time:
+                self.this_tree.step()
+            return self.this_tree.make_choice()
+        else:
+            remaining = time_left()
+            depth = 10 if remaining > 120 else 8
+
+            _, move = self.negamax(board, depth, -float('inf'), float('inf'))
+
+            return move
