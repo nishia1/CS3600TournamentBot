@@ -182,9 +182,11 @@ class PlayerAgent:
 
     def best_carpet_value_from(self, board, pos):
         best = 0
-        for d in [(1,0),(-1,0),(0,1),(0,-1)]:
-            run = self.longest_primed_run_from(board, pos, d)
-            best = max(best, CARPET_POINTS.get(run, 21))
+        for d in [(1,0), (0,1)]:
+            fwd = self.longest_primed_run_from(board, pos, d)
+            bwd = self.longest_primed_run_from(board, pos, (-d[0], -d[1]))
+            run = fwd + bwd  # total run through current position
+            best = max(best, CARPET_POINTS.get(min(run, 7), 21))
         return best
 
     def evaluate(self, board):
@@ -310,10 +312,14 @@ class PlayerAgent:
         if confidence > 0.6:
             search_move = Move.search(rat_pos)
             search_board = board.forecast_move(search_move)
-            #search_board.reverse_perspective()
+            # no reverse_perspective — evaluate from our perspective
             opp_val, _ = self.negamax(search_board, 3, -float('inf'), float('inf'))
             if expectedRat > opp_val:
                 return Move.search(rat_pos)
 
-        _, move = self.negamax(board, 8, -float('inf'), float('inf'))
+        # 3. Scale depth based on remaining time
+        remaining = time_left()
+        depth = 10 if remaining > 120 else 8
+
+        _, move = self.negamax(board, depth, -float('inf'), float('inf'))
         return move
