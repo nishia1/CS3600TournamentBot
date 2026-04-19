@@ -371,8 +371,18 @@ class carlo_tree:
             node_iter = node_iter.par_state
 
         node_iter = curr
+        prev_iter = None
         while node_iter.par_state is not None:
             node_iter.update_ucb1()
+
+            if prev_iter is not None:
+
+                # this nested loop update the ucb1 of child nodes because
+                # they are affected by the change in visits from update_utility
+                for i in list(node_iter.child_states.values()):
+                    if i is not prev_iter:
+                        i.update_ucb1()
+            prev_iter = node_iter
             node_iter = node_iter.par_state
         self.heap.add(curr)
 
