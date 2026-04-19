@@ -302,7 +302,7 @@ class carlo_priority_heap:
 
 # the tree in which the carlo nodes are used
 class carlo_tree:
-    def __init__(self, head_board: list[board], enemy: bool, reward_function: callable = simple_reward()):
+    def __init__(self, head_board: list[board], enemy: bool, reward_function: callable = simple_reward(), exploration_constant = 0.5):
         """
             Args:
                 head_board: this is the starting state.
@@ -315,11 +315,13 @@ class carlo_tree:
                     (parent: board = None, action: MoveType = None, result: board, winner: Result, result_enemy: bool) -> int
                     See implementation of carlo_node.do_rollout for more comments about param expectations
 
+                exploration_constant: is the constant used in computing ucb1,
+                    larger values mean more exploration
         """
         self.head_nodes: list[carlo_node] = list()
         self.heap = carlo_priority_heap()
         for i in head_board:
-            curr = carlo_node(i, enemy, exploration_constant= 0.5)
+            curr = carlo_node(i, enemy, exploration_constant = exploration_constant)
             self.heap.add(curr)
             self.head_nodes.append(curr)
 
