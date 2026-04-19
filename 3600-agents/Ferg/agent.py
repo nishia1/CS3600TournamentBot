@@ -19,7 +19,6 @@ class RatHMM:
         self.T = jnp.array(transition_matrix)
         self.n = BOARD_SIZE * BOARD_SIZE
 
-        # Precompute stationary distribution ONCE
         self.stationary = jnp.linalg.matrix_power(self.T, 50)[0]
 
         xs = jnp.arange(BOARD_SIZE)
@@ -37,13 +36,9 @@ class RatHMM:
         oppRat, oppSearched = board.opponent_search
         myRat, mySearch = board.player_search
         if myRat is not None and mySearch:
-            # we found the rat, so now there is a new rat searching around
-            # check if opp found it or guessed for it
             if oppRat is not None and oppSearched:
-                # opponent also found it, so we reset to stationary (new rat)
                 self.posterior = self.stationary.copy()
             elif oppRat is not None and not oppSearched:
-                # opponent did not find it, so we can be certain the new rat is not where they searched
                 idx = int(oppRat[0] * 8 + oppRat[1])
                 self.posterior = jnp.where(
                     jnp.arange(self.n) == idx,
@@ -51,23 +46,17 @@ class RatHMM:
                     self.posterior
                 )
             else:
-                # we found it and opponent didnt search so reinit everything
                 self.posterior = self.stationary.copy()
         elif myRat is not None and not mySearch:
-            # tried to find but failed
-            # check if opp found it
             if oppRat is not None and oppSearched:
-                # opponent found it, so we need to reset
                 self.posterior = self.stationary.copy()
             elif oppRat is not None and not oppSearched:
-                # opponent also tried but failed, so we can be certain the rat is not where they searched
                 idx = int(oppRat[0] * 8 + oppRat[1])
                 self.posterior = jnp.where(
                     jnp.arange(self.n) == idx,
                     0.0,
                     self.posterior
                 )
-                # also wasn't where i searched
                 idx = int(myRat[0] * 8 + myRat[1])
                 self.posterior = jnp.where(
                     jnp.arange(self.n) == idx,
@@ -75,29 +64,35 @@ class RatHMM:
                     self.posterior
                 )
             else:
-                # we failed and opponent didnt search
-                # but def not where i searched
                 idx = int(myRat[0] * 8 + myRat[1])
                 self.posterior = jnp.where(
                     jnp.arange(self.n) == idx,
                     0.0,
                     self.posterior
                 )
+        elif oppRat is not None and not oppSearched:
+            # opp searched but didn't find
+            idx = int(oppRat[0] * 8 + oppRat[1])
+            self.posterior = jnp.where(
+                jnp.arange(self.n) == idx,
+                0.0,
+                self.posterior
+            )
+        elif oppRat is not None and oppSearched:
+            # opp searched and found, reinit
+            self.posterior = self.stationary.copy()
 
         noise, observed_dist = sensor_data
 
-        # --- PROPAGATE FORWARD then use as prior ---
         self.posterior = self.posterior @ self.T
         prior = self.posterior.copy()
 
-        # --- NOISE LIKELIHOOD ---
         cell_types = jnp.array([
             board.get_cell((int(x), int(y))).value
             for x, y in self.positions
         ])
         noise_probs = self.noise_prob_table[cell_types, noise.value]
 
-        # --- DISTANCE LIKELIHOOD ---
         wx, wy = board.player_worker.get_location()
         worker_pos = jnp.array([wx, wy])
 
@@ -109,7 +104,6 @@ class RatHMM:
                     jnp.where(delta == 1, 0.12,
                     jnp.where(delta == 2, 0.06, 0.0))))
 
-        # --- COMBINE ---
         likelihood = noise_probs * dist_probs
         posterior = prior * likelihood
 
@@ -139,6 +133,7 @@ class PlayerAgent:
 
         self.turn_count = 0
         self.wrong_guess_cooldown = 0
+        self.last_search = None
 
         # --- Transposition table ---
         self.transposition_table = OrderedDict()
@@ -185,7 +180,7 @@ class PlayerAgent:
         for d in [(1,0), (0,1)]:
             fwd = self.longest_primed_run_from(board, pos, d)
             bwd = self.longest_primed_run_from(board, pos, (-d[0], -d[1]))
-            run = fwd + bwd  # total run through current position
+            run = fwd + bwd
             best = max(best, CARPET_POINTS.get(min(run, 7), 21))
         return best
 
@@ -196,7 +191,6 @@ class PlayerAgent:
         return score + mobility + carpet
 
     def move_score(self, board, move, tt_move=None):
-        # TT move gets highest priority
         if tt_move and move == tt_move:
             return 10000
         if move.move_type == MoveType.CARPET:
@@ -220,10 +214,37 @@ class PlayerAgent:
         return 0
 
     def commentate(self):
-        return "ragebait"
+        if self.last_search:
+            pos, conf = self.last_search
+            return f"Last Guess: {pos} @ {conf}"
+        return "Never searched"
+
+    def negamax_shallow(self, board, depth, alpha, beta):
+        """TT-free shallow search for search decision only"""
+        if depth == 0 or board.is_game_over():
+            return self.evaluate(board), None
+        moves = board.get_valid_moves()
+        if not moves:
+            return self.evaluate(board), None
+        moves.sort(key=lambda m: self.move_score(board, m), reverse=True)
+        best_val = -float('inf')
+        best_move = moves[0]
+        for move in moves:
+            nb = board.forecast_move(move)
+            if not nb:
+                continue
+            nb.reverse_perspective()
+            val, _ = self.negamax_shallow(nb, depth - 1, -beta, -alpha)
+            val = -val
+            if val > best_val:
+                best_val = val
+                best_move = move
+            alpha = max(alpha, best_val)
+            if alpha >= beta:
+                break
+        return best_val, best_move
 
     def negamax(self, board, depth, alpha, beta):
-        # --- Transposition table lookup ---
         h = self.board_hash(board)
         tt_move = None
         if h in self.transposition_table:
@@ -268,7 +289,6 @@ class PlayerAgent:
             if alpha >= beta:
                 break
 
-        # --- Store in transposition table ---
         if best_val <= original_alpha:
             flag = 'upper'
         elif best_val >= beta:
@@ -277,7 +297,7 @@ class PlayerAgent:
             flag = 'exact'
 
         if len(self.transposition_table) >= self.TT_SIZE:
-            self.transposition_table.popitem(last=False)  # evict oldest
+            self.transposition_table.popitem(last=False)
         self.transposition_table[h] = {
             'val': best_val,
             'move': best_move,
@@ -287,37 +307,33 @@ class PlayerAgent:
 
         return best_val, best_move
 
-    def iterative_deepening(self, board, time_budget):
-        start = time.time()
-        best_move = None
-        best_val = -float('inf')
-        for depth in range(1, 20):
-            if time.time() - start > time_budget * 0.5:
-                break
-            val, move = self.negamax(board, depth, -float('inf'), float('inf'))
-            if move:
-                best_move = move
-                best_val = val
-            if time.time() - start > time_budget * 0.9:
-                break
-        return best_val, best_move
-
     def play(self, board: Board, sensor_data: Tuple, time_left: Callable):
         # 1. Update HMM belief
         self.rat_hmm.update(sensor_data, board)
         rat_pos, confidence = self.rat_hmm.best_guess()
         expectedRat = 6 * confidence - 2
 
-        # 2. Consider searching — only if confidence is high enough to be worth it
-        if confidence > 0.6:
+        # 2. Dynamic confidence threshold based on score
+        score_diff = board.player_worker.get_points() - board.opponent_worker.get_points()
+        search_threshold = max(0.55, min(0.8, 0.65 + score_diff * 0.02))
+
+        # 3. Consider searching using TT-free shallow search
+        if confidence > search_threshold:
+            # what's our best move value right now?
+            my_val, _ = self.negamax_shallow(board, 3, -float('inf'), float('inf'))
+            # what can opponent do after we search?
             search_move = Move.search(rat_pos)
             search_board = board.forecast_move(search_move)
-            # no reverse_perspective — evaluate from our perspective
-            opp_val, _ = self.negamax(search_board, 3, -float('inf'), float('inf'))
-            if expectedRat > opp_val:
+            search_board.reverse_perspective()
+            opp_val, _ = self.negamax_shallow(search_board, 3, -float('inf'), float('inf'))
+            # net value of searching = rat gain minus what opponent does to us after
+            # only search if that beats our best non-search move
+            net_search = expectedRat - opp_val
+            if net_search > my_val:
+                self.last_search = (rat_pos, round(confidence, 3))
                 return Move.search(rat_pos)
 
-        # 3. Scale depth based on remaining time
+        # 4. Scale depth based on remaining time
         remaining = time_left()
         depth = 10 if remaining > 120 else 8
 
