@@ -280,11 +280,7 @@ class PlayerAgent:
         remaining = time_left()
 
         # 3. Get our best move value
-        a = board.turn_count % 2
-        if a == 0:
-            depth = 10 if remaining > 120 else 8
-        elif a == 1:
-            depth = 9 if remaining > 120 else 7
+        depth = 10 if remaining > 120 else 8
 
         value, move = self.negamax(board, depth, -float('inf'), float('inf'))
 
