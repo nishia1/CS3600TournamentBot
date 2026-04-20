@@ -35,56 +35,19 @@ class RatHMM:
     def update(self, sensor_data, board):
         oppRat, oppSearched = board.opponent_search
         myRat, mySearch = board.player_search
-        if myRat is not None and mySearch:
-            if oppRat is not None and oppSearched:
+        x = [board.player_search, board.opponent_search]
+        for y in x:
+            rat, search = y
+            if search and rat is not None:
+                # found
                 self.posterior = self.stationary.copy()
-            elif oppRat is not None and not oppSearched:
-                idx = int(oppRat[0] * 8 + oppRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-            else:
-                self.posterior = self.stationary.copy()
-        elif myRat is not None and not mySearch:
-            if oppRat is not None and oppSearched:
-                self.posterior = self.stationary.copy()
-            elif oppRat is not None and not oppSearched:
-                idx = int(oppRat[0] * 8 + oppRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-                idx = int(myRat[0] * 8 + myRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-            else:
-                idx = int(myRat[0] * 8 + myRat[1])
-                self.posterior = jnp.where(
-                    jnp.arange(self.n) == idx,
-                    0.0,
-                    self.posterior
-                )
-        elif oppRat is not None and not oppSearched:
-            # opp searched but didn't find
-            idx = int(oppRat[0] * 8 + oppRat[1])
-            self.posterior = jnp.where(
-                jnp.arange(self.n) == idx,
-                0.0,
-                self.posterior
-            )
-        elif oppRat is not None and oppSearched:
-            # opp searched and found, reinit
-            self.posterior = self.stationary.copy()
+            elif not search and rat is not None:
+                # not found
+                idx = rat[1] * BOARD_SIZE + rat[0]
+                self.posterior = jnp.where(jnp.arange(self.n) == idx, 0.0, self.posterior)
+            self.posterior = self.posterior @ self.T
 
         noise, observed_dist = sensor_data
-
-        self.posterior = self.posterior @ self.T
         prior = self.posterior.copy()
 
         cell_types = jnp.array([
@@ -189,6 +152,7 @@ class PlayerAgent:
         mobility = (len(board.get_valid_moves()) - len(board.get_valid_moves(enemy=True))) * 0.5
         carpet = 0.8 * self.best_carpet_value_from(board, board.player_worker.get_location())
         return score + mobility + carpet
+        #return score
 
     def move_score(self, board, move, tt_move=None):
         if tt_move and move == tt_move:
@@ -311,31 +275,43 @@ class PlayerAgent:
         # 1. Update HMM belief
         self.rat_hmm.update(sensor_data, board)
         rat_pos, confidence = self.rat_hmm.best_guess()
-        expectedRat = 6 * confidence - 2
 
-        # 2. Dynamic confidence threshold based on score
-        score_diff = board.player_worker.get_points() - board.opponent_worker.get_points()
-        search_threshold = max(0.55, min(0.8, 0.65 + score_diff * 0.02))
-
-        # 3. Consider searching using TT-free shallow search
-        if confidence > search_threshold:
-            # what's our best move value right now?
-            my_val, _ = self.negamax_shallow(board, 3, -float('inf'), float('inf'))
-            # what can opponent do after we search?
-            search_move = Move.search(rat_pos)
-            search_board = board.forecast_move(search_move)
-            search_board.reverse_perspective()
-            opp_val, _ = self.negamax_shallow(search_board, 3, -float('inf'), float('inf'))
-            # net value of searching = rat gain minus what opponent does to us after
-            # only search if that beats our best non-search move
-            net_search = expectedRat - opp_val
-            if net_search > my_val:
-                self.last_search = (rat_pos, round(confidence, 3))
-                return Move.search(rat_pos)
-
-        # 4. Scale depth based on remaining time
+        # 2. Scale depth based on remaining time
         remaining = time_left()
-        depth = 10 if remaining > 120 else 8
 
-        _, move = self.negamax(board, depth, -float('inf'), float('inf'))
+        # 3. Get our best move value
+        a = board.turn_count % 2
+        if a == 0:
+            depth = 10 if remaining > 120 else 8
+        elif a == 1:
+            depth = 9 if remaining > 120 else 7
+
+        value, move = self.negamax(board, depth, -float('inf'), float('inf'))
+
+        # 4. Simulate opponent's best response after we search
+        search_move = Move.search(rat_pos)
+        search_board = board.forecast_move(search_move)
+        search_board.reverse_perspective()
+        opp_val, _ = self.negamax_shallow(search_board, 3, -float('inf'), float('inf'))
+
+        # 5. Simulate what opponent knows if we guess wrong —
+        #    they learn rat is NOT at rat_pos, so their next best guess confidence
+        wrong_posterior = self.rat_hmm.posterior.copy()
+        idx = rat_pos[1] * BOARD_SIZE + rat_pos[0]
+        wrong_posterior = wrong_posterior.at[idx].set(0.0)
+        total = wrong_posterior.sum()
+        wrong_posterior = jnp.where(total > 0, wrong_posterior / total, wrong_posterior)
+        opp_next_conf = float(jnp.max(wrong_posterior))
+        opp_next_ev = 6 * opp_next_conf - 2  # what opponent expects to gain next turn
+
+        # 6. Full expected value of searching:
+        #    if correct (prob=confidence): gain 4, opponent gets opp_val
+        #    if wrong (prob=1-confidence): lose 2, opponent gains opp_next_ev next turn
+        search_ev = confidence * (4 - opp_val) + (1 - confidence) * (-2 - max(opp_next_ev, opp_val))
+
+        # 7. Search if EV beats our best move — no threshold, just pure EV
+        if search_ev > value:
+            self.last_search = (rat_pos, round(confidence, 3))
+            return Move.search(rat_pos)
+
         return move
